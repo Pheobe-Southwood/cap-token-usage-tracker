@@ -65,11 +65,7 @@ func runDashboardDateRangeBrowserTest(t *testing.T, scenario, description string
 	}
 
 	htmlPath := filepath.Join(t.TempDir(), "dashboard.html")
-	html := dashboardResponse().Body
-	if scenario == "trend-total-full" {
-		html = fullDashboardResponse().Body
-	}
-	if err := os.WriteFile(htmlPath, html, 0o600); err != nil {
+	if err := os.WriteFile(htmlPath, dashboardResponse().Body, 0o600); err != nil {
 		t.Fatalf("write dashboard response body: %v", err)
 	}
 
@@ -80,46 +76,10 @@ func runDashboardDateRangeBrowserTest(t *testing.T, scenario, description string
 	}
 }
 
-func TestDashboardDateRangeCalendarEndIsExclusiveInBrowser(t *testing.T) {
-	runDashboardDateRangeBrowserTest(t, "exclusive", "dashboard calendar browser regression failed")
+func TestDashboardRangePresetsInBrowser(t *testing.T) {
+	runDashboardDateRangeBrowserTest(t, "presets", "dashboard range preset browser regression failed")
 }
 
-func TestDashboardDateRangeCalendarEndTimeStaysOnSelectedDayInBrowser(t *testing.T) {
-	runDashboardDateRangeBrowserTest(t, "end-time", "dashboard calendar end-time browser regression failed")
-}
-
-func TestDashboardDateRangeCalendarReverseSelectionKeepsExclusiveEndInBrowser(t *testing.T) {
-	runDashboardDateRangeBrowserTest(t, "reverse", "dashboard calendar reverse-selection browser regression failed")
-}
-
-func TestDashboardDateRangeCalendarEndTimeResetRestoresExclusiveEndInBrowser(t *testing.T) {
-	runDashboardDateRangeBrowserTest(t, "end-time-reset", "dashboard calendar end-time reset browser regression failed")
-}
-
-func TestDashboardDateRangeQuickPresetIncludesTodayAndAllowsManualTimeInBrowser(t *testing.T) {
-	runDashboardDateRangeBrowserTest(t, "quick-preset", "dashboard quick range includes-today and manual-time browser regression failed")
-}
-
-func TestDashboardDateRangeCalendarAmericaLosAngelesDSTInBrowser(t *testing.T) {
-	runDashboardDateRangeBrowserTest(t, "los-angeles-dst", "dashboard calendar America/Los_Angeles DST browser regression failed")
-}
-
-func TestDashboardTokenUnitCyclesThroughBillionsInBrowser(t *testing.T) {
-	runDashboardDateRangeBrowserTest(t, "token-unit", "dashboard token-unit browser regression failed")
-}
-
-func TestDashboardDateRangeKeepsSavedRangeWhenRecentlyOpenedInBrowser(t *testing.T) {
-	runDashboardDateRangeBrowserTest(t, "recent-open", "dashboard recent-open date range browser regression failed")
-}
-
-func TestDashboardDateRangeResetsToTodayAfterInactivityInBrowser(t *testing.T) {
-	runDashboardDateRangeBrowserTest(t, "expired-open", "dashboard expired-open date range browser regression failed")
-}
-
-func TestDashboardTrendTotalAndCacheGeometryInBrowser(t *testing.T) {
-	runDashboardDateRangeBrowserTest(t, "trend-total", "dashboard trend total/cache geometry browser regression failed")
-}
-
-func TestDashboardTrendTotalAndPNGGeometryInFullModeInBrowser(t *testing.T) {
-	runDashboardDateRangeBrowserTest(t, "trend-total-full", "full-mode trend total/PNG geometry browser regression failed")
+func TestDashboardCustomRangeInBrowser(t *testing.T) {
+	runDashboardDateRangeBrowserTest(t, "custom", "dashboard custom range browser regression failed")
 }

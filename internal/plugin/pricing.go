@@ -1,389 +1,532 @@
 package plugin
 
 import (
+	"context"
 	"fmt"
 	"math"
-	"sort"
 	"strings"
+	"sync"
 	"time"
-	"unicode/utf8"
+
+	"github.com/AITNR/cap-token-usage-tracker/internal/plugin/modelcatalog"
 )
 
 const (
-	maxModelPriceEntries = 10_000
-	maxContextPriceTiers = 16
-	maxServiceTierPrices = 16
-	maxTokenPricePerM    = 1_000_000.0
-
-	accountingModeInputExcludesCache = "input_excludes_cache"
-	accountingModeInputIncludesCache = "input_includes_cache"
-
-	priceSourceManual    = "manual"
-	priceSourceModelsDev = "models.dev"
+	// maxModelPriceValue bounds one manually entered rate (USD per 1M tokens).
+	maxModelPriceValue = 1_000_000
+	// maxModelPriceOverrides bounds the stored override table.
+	maxModelPriceOverrides = 10_000
+	// maxModelPriceModelBytes bounds one overridden model id.
+	maxModelPriceModelBytes = 200
+	// priceDecimals is the stored precision of a manual rate.
+	priceDecimals = 6
 )
 
-// TokenRates stores USD prices per one million tokens for each billable counter.
-type TokenRates struct {
-	Input         float64 `json:"input"`
-	Output        float64 `json:"output"`
-	CacheRead     float64 `json:"cache_read"`
-	CacheCreation float64 `json:"cache_creation"`
-}
-
-// ContextPriceTier replaces the base rates when one request exceeds Threshold context tokens.
-type ContextPriceTier struct {
-	Threshold     uint64  `json:"threshold"`
-	Input         float64 `json:"input"`
-	Output        float64 `json:"output"`
-	CacheRead     float64 `json:"cache_read"`
-	CacheCreation float64 `json:"cache_creation"`
-}
-
-// ServiceTierPrice replaces the base price schedule for one request service tier.
-// It may define its own context tiers because catalog mode pricing can vary by
-// both service tier and context size.
-type ServiceTierPrice struct {
-	Input         float64            `json:"input"`
-	Output        float64            `json:"output"`
-	CacheRead     float64            `json:"cache_read"`
-	CacheCreation float64            `json:"cache_creation"`
-	ContextTiers  []ContextPriceTier `json:"context_tiers,omitempty"`
-}
-
-// ModelPrice stores the active rates and optional synchronization provenance for one model.
+// ModelPrice is a list price in USD per 1,000,000 tokens. Missing fields mean
+// "inherit": for a stored override they fall back to the catalog rate, and for
+// an effective price they mean the rate is unknown.
+//
+// TimeZone and TimeTiers optionally add a weekly time-of-use schedule. A
+// matched tier overrides the four base rates field by field, so a tier can be
+// a peak surcharge or an off-peak discount.
 type ModelPrice struct {
-	timeLocation    *time.Location
-	TimeZone        string                      `json:"time_zone,omitempty"`
-	TimeTiers       []TimePriceTier             `json:"time_tiers,omitempty"`
-	Input           float64                     `json:"input"`
-	Output          float64                     `json:"output"`
-	CacheRead       float64                     `json:"cache_read"`
-	CacheCreation   float64                     `json:"cache_creation"`
-	ContextTiers    []ContextPriceTier          `json:"context_tiers,omitempty"`
-	ServiceTiers    map[string]ServiceTierPrice `json:"service_tiers,omitempty"`
-	AccountingMode  string                      `json:"accounting_mode,omitempty"`
-	Source          string                      `json:"source,omitempty"`
-	CatalogProvider string                      `json:"catalog_provider,omitempty"`
-	CatalogModel    string                      `json:"catalog_model,omitempty"`
-	UpdatedAt       time.Time                   `json:"updated_at,omitempty"`
+	Input      *float64        `json:"input,omitempty"`
+	Output     *float64        `json:"output,omitempty"`
+	CacheRead  *float64        `json:"cache_read,omitempty"`
+	CacheWrite *float64        `json:"cache_write,omitempty"`
+	TimeZone   string          `json:"time_zone,omitempty"`
+	TimeTiers  []TimePriceTier `json:"time_tiers,omitempty"`
 }
 
-type PriceSyncMapping struct {
-	Source string `json:"source"`
-	Target string `json:"target"`
+// Priced reports whether the price carries a usable rate. Only input or output
+// count, mirroring the upstream chain: a record with cache rates alone cannot
+// produce a cost.
+func (p ModelPrice) Priced() bool {
+	return p.Input != nil || p.Output != nil
 }
 
-type PriceSyncSettings struct {
-	ProviderPriority []string           `json:"provider_priority"`
-	IgnoredSuffixes  []string           `json:"ignored_suffixes"`
-	Mappings         []PriceSyncMapping `json:"mappings"`
+// Free reports whether the price is an explicit zero price.
+func (p ModelPrice) Free() bool {
+	return p.Priced() && priceValue(p.Input) == 0 && priceValue(p.Output) == 0
 }
 
-type PriceSyncMetadata struct {
-	Source        string    `json:"source"`
-	CompletedAt   time.Time `json:"completed_at"`
-	Observed      int       `json:"observed"`
-	Matched       int       `json:"matched"`
-	Created       int       `json:"created"`
-	Updated       int       `json:"updated"`
-	SkippedManual int       `json:"skipped_manual"`
-	Unmatched     int       `json:"unmatched"`
+// Empty reports whether no rate is set.
+func (p ModelPrice) Empty() bool {
+	return p.Input == nil && p.Output == nil && p.CacheRead == nil && p.CacheWrite == nil && len(p.TimeTiers) == 0
 }
 
-type ModelPricesResponse struct {
-	SchemaVersion uint32                `json:"schema_version"`
-	Revision      uint64                `json:"revision"`
-	Prices        map[string]ModelPrice `json:"prices"`
-	SyncSettings  PriceSyncSettings     `json:"sync_settings"`
-	LastSync      *PriceSyncMetadata    `json:"last_sync,omitempty"`
-}
-
-func defaultPriceSyncSettings() PriceSyncSettings {
-	return PriceSyncSettings{
-		ProviderPriority: []string{"openai", "google", "anthropic"},
-		IgnoredSuffixes: []string{
-			"-thinking", "-preview", "-high", "-low", "(thinking)", "(xhigh)", "(high)", "(low)",
-		},
+// merge applies the non-nil fields of other on top of p. A time schedule is
+// replaced as a whole because a partial schedule has no meaning.
+func (p ModelPrice) merge(other ModelPrice) ModelPrice {
+	merged := p
+	if other.Input != nil {
+		merged.Input = other.Input
 	}
+	if other.Output != nil {
+		merged.Output = other.Output
+	}
+	if other.CacheRead != nil {
+		merged.CacheRead = other.CacheRead
+	}
+	if other.CacheWrite != nil {
+		merged.CacheWrite = other.CacheWrite
+	}
+	if len(other.TimeTiers) > 0 {
+		merged.TimeZone = other.TimeZone
+		merged.TimeTiers = cloneTimeTiers(other.TimeTiers)
+	}
+	return merged
 }
 
-func normalizePriceSyncSettings(input PriceSyncSettings) (PriceSyncSettings, error) {
-	defaults := defaultPriceSyncSettings()
-	result := PriceSyncSettings{}
-	if len(input.ProviderPriority) == 0 {
-		result.ProviderPriority = append([]string(nil), defaults.ProviderPriority...)
-	} else {
-		seen := make(map[string]struct{}, len(input.ProviderPriority))
-		for _, raw := range input.ProviderPriority {
-			value := normalizeCatalogName(raw)
-			if value == "" {
-				continue
-			}
-			if _, exists := seen[value]; exists {
-				continue
-			}
-			seen[value] = struct{}{}
-			result.ProviderPriority = append(result.ProviderPriority, value)
-		}
-		if len(result.ProviderPriority) == 0 {
-			result.ProviderPriority = append([]string(nil), defaults.ProviderPriority...)
-		}
+func priceValue(value *float64) float64 {
+	if value == nil {
+		return 0
 	}
-	if len(input.IgnoredSuffixes) == 0 {
-		result.IgnoredSuffixes = append([]string(nil), defaults.IgnoredSuffixes...)
-	} else {
-		seen := make(map[string]struct{}, len(input.IgnoredSuffixes))
-		for _, raw := range input.IgnoredSuffixes {
-			value := strings.ToLower(strings.TrimSpace(raw))
-			if value == "" {
-				continue
-			}
-			if !validOptionalDimension(value) {
-				return PriceSyncSettings{}, fmt.Errorf("ignored model suffix %q is invalid or too long", raw)
-			}
-			if _, exists := seen[value]; exists {
-				continue
-			}
-			seen[value] = struct{}{}
-			result.IgnoredSuffixes = append(result.IgnoredSuffixes, value)
-		}
-		if len(result.IgnoredSuffixes) == 0 {
-			result.IgnoredSuffixes = append([]string(nil), defaults.IgnoredSuffixes...)
-		}
-	}
-	if len(input.Mappings) > maxModelPriceEntries {
-		return PriceSyncSettings{}, fmt.Errorf("model price mappings must contain at most %d entries", maxModelPriceEntries)
-	}
-	seenMappings := make(map[string]struct{}, len(input.Mappings))
-	for _, mapping := range input.Mappings {
-		source := normalizeCatalogName(mapping.Source)
-		target := normalizeCatalogName(mapping.Target)
-		if source == "" || target == "" {
-			return PriceSyncSettings{}, fmt.Errorf("model price mappings require non-empty source and target")
-		}
-		key := source + "\x00" + target
-		if _, exists := seenMappings[key]; exists {
+	return *value
+}
+
+func priceFromCatalog(price modelcatalog.Price) ModelPrice {
+	return ModelPrice{Input: price.Input, Output: price.Output, CacheRead: price.CacheRead, CacheWrite: price.CacheWrite}
+}
+
+// normalizeModelPrice validates and rounds one manually entered price.
+func normalizeModelPrice(model string, raw ModelPrice) (ModelPrice, error) {
+	normalized := ModelPrice{}
+	for _, field := range []struct {
+		name   string
+		value  *float64
+		target **float64
+	}{
+		{name: "input", value: raw.Input, target: &normalized.Input},
+		{name: "output", value: raw.Output, target: &normalized.Output},
+		{name: "cache_read", value: raw.CacheRead, target: &normalized.CacheRead},
+		{name: "cache_write", value: raw.CacheWrite, target: &normalized.CacheWrite},
+	} {
+		if field.value == nil {
 			continue
 		}
-		seenMappings[key] = struct{}{}
-		result.Mappings = append(result.Mappings, PriceSyncMapping{Source: source, Target: target})
+		rounded, err := normalizePriceValue(*field.value)
+		if err != nil {
+			return ModelPrice{}, fmt.Errorf("%s: %w", field.name, err)
+		}
+		pointer := rounded
+		*field.target = &pointer
 	}
-	return result, nil
-}
-
-func (p ModelPrice) tokenRates() TokenRates {
-	return TokenRates{Input: p.Input, Output: p.Output, CacheRead: p.CacheRead, CacheCreation: p.CacheCreation}
-}
-
-func (t ContextPriceTier) tokenRates() TokenRates {
-	return TokenRates{Input: t.Input, Output: t.Output, CacheRead: t.CacheRead, CacheCreation: t.CacheCreation}
-}
-
-func (p ServiceTierPrice) tokenRates() TokenRates {
-	return TokenRates{Input: p.Input, Output: p.Output, CacheRead: p.CacheRead, CacheCreation: p.CacheCreation}
-}
-
-func normalizeModelPrices(input map[string]ModelPrice) (map[string]ModelPrice, error) {
-	if len(input) > maxModelPriceEntries {
-		return nil, fmt.Errorf("model prices must contain at most %d entries", maxModelPriceEntries)
+	normalized.TimeZone = raw.TimeZone
+	normalized.TimeTiers = raw.TimeTiers
+	if err := normalizeTimePricing(model, &normalized); err != nil {
+		return ModelPrice{}, err
 	}
-	result := make(map[string]ModelPrice, len(input))
-	seen := make(map[string]string, len(input))
-	for rawModel, rawPrice := range input {
-		model := strings.TrimSpace(rawModel)
-		if model == "" {
-			return nil, fmt.Errorf("model price name must not be empty")
-		}
-		if !utf8.ValidString(model) || utf8.RuneCountInString(model) > maxDimensionRunes {
-			return nil, fmt.Errorf("model price name %q is invalid or too long", model)
-		}
-		if previous, exists := seen[model]; exists {
-			return nil, fmt.Errorf("model price names %q and %q normalize to the same model", previous, rawModel)
-		}
-		seen[model] = rawModel
+	return normalized, nil
+}
 
-		price, err := normalizeModelPrice(model, rawPrice)
+func normalizePriceValue(value float64) (float64, error) {
+	if math.IsNaN(value) || math.IsInf(value, 0) {
+		return 0, fmt.Errorf("price must be a finite number")
+	}
+	if value < 0 {
+		return 0, fmt.Errorf("price must not be negative")
+	}
+	if value > maxModelPriceValue {
+		return 0, fmt.Errorf("price must not exceed %d", maxModelPriceValue)
+	}
+	scale := math.Pow(10, priceDecimals)
+	return math.Round(value*scale) / scale, nil
+}
+
+// normalizeOverrideModel validates an override key.
+func normalizeOverrideModel(model string) (string, error) {
+	trimmed := strings.TrimSpace(model)
+	if trimmed == "" {
+		return "", fmt.Errorf("model must not be empty")
+	}
+	if len(trimmed) > maxModelPriceModelBytes {
+		return "", fmt.Errorf("model must not exceed %d bytes", maxModelPriceModelBytes)
+	}
+	if strings.ContainsAny(trimmed, "\x00\n\r") {
+		return "", fmt.Errorf("model must not contain control characters")
+	}
+	return trimmed, nil
+}
+
+// normalizeModelPriceOverrides validates a whole override table, typically read
+// back from storage.
+func normalizeModelPriceOverrides(raw map[string]ModelPrice) (map[string]ModelPrice, error) {
+	if len(raw) == 0 {
+		return nil, nil
+	}
+	if len(raw) > maxModelPriceOverrides {
+		return nil, fmt.Errorf("model price overrides exceed %d entries", maxModelPriceOverrides)
+	}
+	normalized := make(map[string]ModelPrice, len(raw))
+	for model, price := range raw {
+		key, err := normalizeOverrideModel(model)
 		if err != nil {
 			return nil, err
 		}
-		if price.Source == "" {
-			price.Source = priceSourceManual
-		}
-		result[model] = price
-	}
-	return result, nil
-}
-
-func normalizeModelPrice(model string, price ModelPrice) (ModelPrice, error) {
-	if err := validateTokenRates(price.tokenRates(), model, "base"); err != nil {
-		return ModelPrice{}, err
-	}
-	price.AccountingMode = strings.TrimSpace(price.AccountingMode)
-	switch price.AccountingMode {
-	case "", accountingModeInputExcludesCache, accountingModeInputIncludesCache:
-	default:
-		return ModelPrice{}, fmt.Errorf("accounting mode for model %q must be %q or %q", model, accountingModeInputExcludesCache, accountingModeInputIncludesCache)
-	}
-
-	price.Source = strings.TrimSpace(price.Source)
-	switch price.Source {
-	case "", priceSourceManual, priceSourceModelsDev:
-	default:
-		return ModelPrice{}, fmt.Errorf("price source for model %q is invalid", model)
-	}
-	price.CatalogProvider = strings.TrimSpace(price.CatalogProvider)
-	price.CatalogModel = strings.TrimSpace(price.CatalogModel)
-	if !validOptionalDimension(price.CatalogProvider) || !validOptionalDimension(price.CatalogModel) {
-		return ModelPrice{}, fmt.Errorf("catalog identity for model %q is invalid or too long", model)
-	}
-
-	tiers, err := normalizeContextPriceTiers(model, "", price.ContextTiers)
-	if err != nil {
-		return ModelPrice{}, err
-	}
-	price.ContextTiers = tiers
-	if err := normalizeTimePricing(model, &price); err != nil {
-		return ModelPrice{}, err
-	}
-
-	if len(price.ServiceTiers) > maxServiceTierPrices {
-		return ModelPrice{}, fmt.Errorf("model %q must contain at most %d service tier prices", model, maxServiceTierPrices)
-	}
-	serviceTiers := make(map[string]ServiceTierPrice, len(price.ServiceTiers))
-	for rawTier, rawSchedule := range price.ServiceTiers {
-		tier := strings.ToLower(strings.TrimSpace(rawTier))
-		if tier == "" || !validOptionalDimension(tier) {
-			return ModelPrice{}, fmt.Errorf("service tier %q for model %q is invalid or too long", rawTier, model)
-		}
-		if _, exists := serviceTiers[tier]; exists {
-			return ModelPrice{}, fmt.Errorf("service tier prices for model %q normalize to the same tier %q", model, tier)
-		}
-		if err := validateTokenRates(rawSchedule.tokenRates(), model, "service tier "+tier); err != nil {
-			return ModelPrice{}, err
-		}
-		scheduleTiers, err := normalizeContextPriceTiers(model, "service tier "+tier+" ", rawSchedule.ContextTiers)
+		value, err := normalizeModelPrice(key, price)
 		if err != nil {
-			return ModelPrice{}, err
+			return nil, fmt.Errorf("%s: %w", key, err)
 		}
-		rawSchedule.ContextTiers = scheduleTiers
-		serviceTiers[tier] = rawSchedule
+		if value.Empty() {
+			continue
+		}
+		normalized[key] = value
 	}
-	if len(serviceTiers) == 0 {
-		price.ServiceTiers = nil
-	} else {
-		price.ServiceTiers = serviceTiers
+	if len(normalized) == 0 {
+		return nil, nil
 	}
-	return price, nil
+	return normalized, nil
 }
 
-func normalizeContextPriceTiers(model, scope string, input []ContextPriceTier) ([]ContextPriceTier, error) {
-	if len(input) > maxContextPriceTiers {
-		return nil, fmt.Errorf("model %q must contain at most %d %scontext price tiers", model, maxContextPriceTiers, scope)
-	}
-	tiers := append([]ContextPriceTier(nil), input...)
-	sort.Slice(tiers, func(i, j int) bool { return tiers[i].Threshold < tiers[j].Threshold })
-	for index := range tiers {
-		tier := tiers[index]
-		if tier.Threshold == 0 {
-			return nil, fmt.Errorf("%scontext price threshold for model %q must be greater than zero", scope, model)
-		}
-		if index > 0 && tiers[index-1].Threshold == tier.Threshold {
-			return nil, fmt.Errorf("%scontext price thresholds for model %q must be unique", scope, model)
-		}
-		if err := validateTokenRates(tier.tokenRates(), model, fmt.Sprintf("%scontext tier %d", scope, tier.Threshold)); err != nil {
-			return nil, err
-		}
-	}
-	return tiers, nil
-}
-
-func validateTokenRates(rates TokenRates, model, scope string) error {
-	for _, value := range []struct {
-		name  string
-		price float64
-	}{
-		{name: "input", price: rates.Input},
-		{name: "output", price: rates.Output},
-		{name: "cache read", price: rates.CacheRead},
-		{name: "cache creation", price: rates.CacheCreation},
-	} {
-		if err := validateTokenPrice(value.price, model, scope+" "+value.name); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func validateTokenPrice(value float64, model, kind string) error {
-	if math.IsNaN(value) || math.IsInf(value, 0) || value < 0 || value > maxTokenPricePerM {
-		return fmt.Errorf("%s price for model %q must be between 0 and %.0f USD per 1M tokens", kind, model, maxTokenPricePerM)
-	}
-	return nil
-}
-
-func validOptionalDimension(value string) bool {
-	return value == "" || utf8.ValidString(value) && utf8.RuneCountInString(value) <= maxDimensionRunes
-}
-
-func tokenRatesZero(rates TokenRates) bool {
-	return rates.Input == 0 && rates.Output == 0 && rates.CacheRead == 0 && rates.CacheCreation == 0
-}
-
-func sameEditableModelPrice(left, right ModelPrice) bool {
-	if !sameTimePricing(left, right) {
-		return false
-	}
-	if left.Input != right.Input || left.Output != right.Output || left.CacheRead != right.CacheRead || left.CacheCreation != right.CacheCreation || left.AccountingMode != right.AccountingMode || len(left.ContextTiers) != len(right.ContextTiers) || len(left.ServiceTiers) != len(right.ServiceTiers) {
-		return false
-	}
-	for index := range left.ContextTiers {
-		if left.ContextTiers[index] != right.ContextTiers[index] {
-			return false
-		}
-	}
-	for tier, leftSchedule := range left.ServiceTiers {
-		rightSchedule, ok := right.ServiceTiers[tier]
-		if !ok || leftSchedule.Input != rightSchedule.Input || leftSchedule.Output != rightSchedule.Output || leftSchedule.CacheRead != rightSchedule.CacheRead || leftSchedule.CacheCreation != rightSchedule.CacheCreation || len(leftSchedule.ContextTiers) != len(rightSchedule.ContextTiers) {
-			return false
-		}
-		for index := range leftSchedule.ContextTiers {
-			if leftSchedule.ContextTiers[index] != rightSchedule.ContextTiers[index] {
-				return false
-			}
-		}
-	}
-	return true
-}
-
-func cloneModelPrices(input map[string]ModelPrice) map[string]ModelPrice {
-	result := make(map[string]ModelPrice, len(input))
-	for model, price := range input {
-		price.TimeTiers = cloneTimeTiers(price.TimeTiers)
-		price.ContextTiers = append([]ContextPriceTier(nil), price.ContextTiers...)
-		if len(price.ServiceTiers) > 0 {
-			price.ServiceTiers = make(map[string]ServiceTierPrice, len(price.ServiceTiers))
-			for tier, schedule := range input[model].ServiceTiers {
-				schedule.ContextTiers = append([]ContextPriceTier(nil), schedule.ContextTiers...)
-				price.ServiceTiers[tier] = schedule
-			}
-		}
-		result[model] = price
-	}
-	return result
-}
-
-func clonePriceSyncSettings(input PriceSyncSettings) PriceSyncSettings {
-	return PriceSyncSettings{
-		ProviderPriority: append([]string(nil), input.ProviderPriority...),
-		IgnoredSuffixes:  append([]string(nil), input.IgnoredSuffixes...),
-		Mappings:         append([]PriceSyncMapping(nil), input.Mappings...),
-	}
-}
-
-func clonePriceSyncMetadata(input *PriceSyncMetadata) *PriceSyncMetadata {
-	if input == nil {
+func cloneModelPriceOverrides(raw map[string]ModelPrice) map[string]ModelPrice {
+	if len(raw) == 0 {
 		return nil
 	}
-	result := *input
-	return &result
+	cloned := make(map[string]ModelPrice, len(raw))
+	for model, price := range raw {
+		price.TimeTiers = cloneTimeTiers(price.TimeTiers)
+		cloned[model] = price
+	}
+	return cloned
+}
+
+// resolvedPrice is the effective price of one model together with the evidence
+// behind it. It is embedded in API responses. TimeZone/TimeTiers describe the
+// schedule the cost formula applies; TimePlanSource says where it came from so
+// the dashboard can label a bundled plan.
+type resolvedPrice struct {
+	Price           ModelPrice      `json:"price,omitzero"`
+	Priced          bool            `json:"priced"`
+	Free            bool            `json:"free"`
+	Source          string          `json:"price_source"`
+	Override        ModelPrice      `json:"override,omitzero"`
+	CatalogProvider string          `json:"catalog_provider,omitempty"`
+	CatalogModel    string          `json:"catalog_model,omitempty"`
+	CatalogMatch    string          `json:"catalog_match,omitempty"`
+	TimeZone        string          `json:"time_zone,omitempty"`
+	TimeTiers       []TimePriceTier `json:"time_tiers,omitempty"`
+	TimePlanSource  string          `json:"time_plan_source,omitempty"`
+}
+
+// Price source labels.
+const (
+	priceSourceNone     = "none"
+	priceSourceCatalog  = "catalog"
+	priceSourceOverride = "override"
+	priceSourceBuiltin  = "builtin"
+)
+
+// tokenSemantics describes how an upstream protocol reports cache tokens
+// relative to the prompt total.
+type tokenSemantics uint8
+
+const (
+	// semanticsSubset: cache tokens are included in the input total.
+	semanticsSubset tokenSemantics = iota
+	// semanticsIndependent: cache tokens are separate from the input total.
+	semanticsIndependent
+	// semanticsSeparateReasoning: cache included in input, reasoning separate
+	// from output.
+	semanticsSeparateReasoning
+)
+
+// tokenSemanticsFor mirrors CLIProxyAPI's provider/executor classification so
+// the cost formula reads the same buckets the host normalized.
+func tokenSemanticsFor(provider, executorType string) (tokenSemantics, bool) {
+	normalizedProvider := strings.ToLower(strings.TrimSpace(provider))
+	normalizedExecutor := strings.ToLower(strings.TrimSpace(executorType))
+	value := strings.TrimSpace(normalizedProvider + " " + normalizedExecutor)
+	if value == "" || value == "unknown" || value == "unknown unknown" {
+		return semanticsSubset, false
+	}
+	if normalizedExecutor == "openaicompatexecutor" || normalizedProvider == "openai-compatibility" || strings.HasPrefix(normalizedProvider, "openai-compatible-") {
+		return semanticsSubset, true
+	}
+	if strings.Contains(value, "claude") || strings.Contains(value, "anthropic") {
+		return semanticsIndependent, true
+	}
+	for _, marker := range []string{"gemini", "aistudio", "antigravity", "vertex", "interaction"} {
+		if strings.Contains(value, marker) {
+			return semanticsSeparateReasoning, true
+		}
+	}
+	for _, marker := range []string{"openai", "codex", "xai", "grok", "kimi", "qwen", "deepseek", "openrouter"} {
+		if strings.Contains(value, marker) {
+			return semanticsSubset, true
+		}
+	}
+	return semanticsSubset, false
+}
+
+// inferTokenSemantics classifies a group from its provider/executor, falling
+// back to arithmetic evidence from the token totals when the provider is not
+// recognized.
+func inferTokenSemantics(dimensions Dimensions, counters Counters) tokenSemantics {
+	if semantics, known := tokenSemanticsFor(dimensions.Provider, dimensions.ExecutorType); known {
+		return semantics
+	}
+	total := counters.TotalTokens
+	if total == 0 {
+		return semanticsSubset
+	}
+	subset := saturatingAdd(saturatingAdd(counters.InputTokens, counters.OutputTokens), counters.ReasoningTokens)
+	independent := saturatingAdd(saturatingAdd(counters.InputTokens, cacheReadTokens(counters)), counters.CacheCreationTokens)
+	independent = saturatingAdd(saturatingAdd(independent, counters.OutputTokens), counters.ReasoningTokens)
+	switch total {
+	case subset:
+		return semanticsSubset
+	case independent:
+		return semanticsIndependent
+	}
+	return semanticsSubset
+}
+
+// cacheReadTokens prefers the dedicated cache-read bucket and falls back to the
+// legacy total-cached counter.
+func cacheReadTokens(counters Counters) uint64 {
+	if counters.CacheReadTokens > counters.CachedTokens {
+		return counters.CacheReadTokens
+	}
+	return counters.CachedTokens
+}
+
+// costForCounters applies the list price to one aggregated group.
+func costForCounters(price ModelPrice, semantics tokenSemantics, counters Counters) float64 {
+	inputPrice := priceValue(price.Input)
+	outputPrice := priceValue(price.Output)
+	cacheReadPrice := priceValue(price.CacheRead)
+	if price.CacheRead == nil {
+		cacheReadPrice = inputPrice
+	}
+	cacheWritePrice := priceValue(price.CacheWrite)
+	if price.CacheWrite == nil {
+		cacheWritePrice = inputPrice
+	}
+	cacheRead := cacheReadTokens(counters)
+	cacheWrite := counters.CacheCreationTokens
+	uncached := counters.InputTokens
+	if semantics != semanticsIndependent {
+		cached := saturatingAdd(cacheRead, cacheWrite)
+		if cached >= uncached {
+			uncached = 0
+		} else {
+			uncached -= cached
+		}
+	}
+	amount := (float64(uncached)*inputPrice +
+		float64(cacheRead)*cacheReadPrice +
+		float64(cacheWrite)*cacheWritePrice +
+		float64(counters.OutputTokens)*outputPrice) / 1_000_000
+	if math.IsNaN(amount) || amount < 0 {
+		return 0
+	}
+	return amount
+}
+
+// modelThroughput derives both TPS variants from aggregated counters. The
+// generation variant excludes time to first token; the end-to-end variant does
+// not.
+func modelThroughput(dimensions Dimensions, counters Counters) (float64, float64) {
+	numerator := effectiveOutputTokensForTPS(dimensions, counters, false)
+	if numerator == 0 {
+		return 0, 0
+	}
+	generationNS := counters.TotalLatencyNS
+	if counters.TotalTTFTNS < generationNS {
+		generationNS -= counters.TotalTTFTNS
+	} else {
+		generationNS = 0
+	}
+	generationTPS := 0.0
+	if generationNS > 0 {
+		generationTPS = float64(numerator) / (float64(generationNS) / float64(time.Second))
+	}
+	endToEndTPS := 0.0
+	if counters.TotalLatencyNS > 0 {
+		endToEndTPS = float64(numerator) / (float64(counters.TotalLatencyNS) / float64(time.Second))
+	}
+	return generationTPS, endToEndTPS
+}
+
+type priceMemoKey struct {
+	source   string
+	provider string
+	model    string
+}
+
+// pricingTable resolves effective prices for aggregated groups. It owns the
+// in-memory override table so aggregation never re-enters the store actor.
+type pricingTable struct {
+	catalog *modelcatalog.Service
+
+	mu        sync.RWMutex
+	overrides map[string]ModelPrice
+	memo      map[priceMemoKey]resolvedPrice
+	// builtinTimePlans enables the bundled vendor time-of-use schedules for
+	// models that carry no manual schedule of their own.
+	builtinTimePlans bool
+}
+
+func newPricingTable(catalog *modelcatalog.Service) *pricingTable {
+	return &pricingTable{catalog: catalog, memo: map[priceMemoKey]resolvedPrice{}, builtinTimePlans: true}
+}
+
+// SetOverrides replaces the whole override table.
+func (t *pricingTable) SetOverrides(overrides map[string]ModelPrice) {
+	t.mu.Lock()
+	t.overrides = cloneModelPriceOverrides(overrides)
+	t.memo = map[priceMemoKey]resolvedPrice{}
+	t.mu.Unlock()
+}
+
+// SetBuiltinTimePlans toggles the bundled schedules. The effective schedule is
+// part of a resolved price, so the memo has to be dropped.
+func (t *pricingTable) SetBuiltinTimePlans(enabled bool) {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	t.builtinTimePlans = enabled
+	t.memo = map[priceMemoKey]resolvedPrice{}
+	t.mu.Unlock()
+}
+
+// Overrides returns a copy of the override table.
+func (t *pricingTable) Overrides() map[string]ModelPrice {
+	if t == nil {
+		return nil
+	}
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return cloneModelPriceOverrides(t.overrides)
+}
+
+// OverrideCount returns the number of stored overrides.
+func (t *pricingTable) OverrideCount() int {
+	if t == nil {
+		return 0
+	}
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return len(t.overrides)
+}
+
+// PriceFor resolves the effective price of one model.
+func (t *pricingTable) PriceFor(dimensions Dimensions) resolvedPrice {
+	if t == nil {
+		return resolvedPrice{Source: priceSourceNone}
+	}
+	key := priceMemoKey{source: dimensions.Source, provider: dimensions.Provider, model: dimensions.Model}
+	t.mu.RLock()
+	if cached, ok := t.memo[key]; ok {
+		t.mu.RUnlock()
+		return cached
+	}
+	override, hasOverride := t.overrides[dimensions.Model]
+	t.mu.RUnlock()
+
+	resolved := resolvedPrice{Source: priceSourceNone}
+	if hasOverride {
+		resolved.Override = override
+	}
+	if t.catalog != nil {
+		if _, index := t.catalog.Snapshot(); index != nil {
+			if match, ok := index.Lookup(dimensions.Source, dimensions.Provider, dimensions.Model); ok {
+				resolved.CatalogProvider = match.ProviderID
+				resolved.CatalogModel = match.ModelID
+				resolved.CatalogMatch = match.Kind
+				resolved.Price = priceFromCatalog(match.Model.Cost)
+			}
+		}
+	}
+	if hasOverride {
+		resolved.Price = resolved.Price.merge(override)
+		resolved.Source = priceSourceOverride
+	} else if resolved.Price.Priced() {
+		resolved.Source = priceSourceCatalog
+	}
+	resolved.Priced = resolved.Price.Priced()
+	resolved.Free = resolved.Price.Free()
+	if !resolved.Priced {
+		resolved.Source = priceSourceNone
+	}
+
+	// The schedule lives beside the rates, never inside them: a manual schedule
+	// wins, otherwise the bundled vendor plan applies. A manual price that only
+	// edits rates therefore keeps the bundled schedule.
+	resolved.Price.TimeZone = ""
+	resolved.Price.TimeTiers = nil
+	if hasOverride && len(override.TimeTiers) > 0 {
+		resolved.TimeZone = override.TimeZone
+		resolved.TimeTiers = cloneTimeTiers(override.TimeTiers)
+		resolved.TimePlanSource = priceSourceOverride
+	} else {
+		t.mu.RLock()
+		builtinEnabled := t.builtinTimePlans
+		t.mu.RUnlock()
+		if builtinEnabled {
+			if plan, ok := builtinTimePlanFor(resolved.CatalogProvider, dimensions.Model); ok {
+				resolved.TimeZone = plan.TimeZone
+				resolved.TimeTiers = cloneTimeTiers(plan.TimeTiers)
+				resolved.TimePlanSource = priceSourceBuiltin
+			}
+		}
+	}
+
+	t.mu.Lock()
+	if len(t.memo) >= 100_000 {
+		t.memo = map[priceMemoKey]resolvedPrice{}
+	}
+	t.memo[key] = resolved
+	t.mu.Unlock()
+	return resolved
+}
+
+// chargeFor applies a resolved price to one aggregated group at the request
+// time and reports the signed delta contributed by an active time tier.
+// Amounts are USD; surcharge is negative for an off-peak discount.
+func chargeFor(resolved resolvedPrice, dimensions Dimensions, counters Counters, at time.Time) (amount, surcharge float64, priced bool) {
+	if !resolved.Priced {
+		return 0, 0, false
+	}
+	semantics := inferTokenSemantics(dimensions, counters)
+	base := costForCounters(resolved.Price, semantics, counters)
+	tier, ok := selectTimeTier(resolved.TimeZone, resolved.TimeTiers, at)
+	if !ok {
+		return base, 0, true
+	}
+	amount = costForCounters(resolved.Price.merge(timeTierRates(tier)), semantics, counters)
+	return amount, amount - base, true
+}
+
+// Cost returns the estimated cost of one aggregated group at the given request
+// time.
+func (t *pricingTable) Cost(dimensions Dimensions, counters Counters, at time.Time) (float64, bool) {
+	amount, _, priced := chargeFor(t.PriceFor(dimensions), dimensions, counters, at)
+	return amount, priced
+}
+
+// Status exposes the catalog status for API responses.
+func (t *pricingTable) Status() modelcatalog.Status {
+	if t == nil || t.catalog == nil {
+		return modelcatalog.Status{Status: modelcatalog.StatusMissing, Source: modelcatalog.SourceEmbedded}
+	}
+	return t.catalog.Status()
+}
+
+// NeedsRefresh reports whether the catalog should be refreshed.
+func (t *pricingTable) NeedsRefresh() bool {
+	if t == nil || t.catalog == nil {
+		return false
+	}
+	return t.catalog.NeedsRefresh()
+}
+
+// RefreshCatalog downloads a new catalog snapshot.
+func (t *pricingTable) RefreshCatalog(ctx context.Context) (modelcatalog.Status, error) {
+	if t == nil || t.catalog == nil {
+		return modelcatalog.Status{Status: modelcatalog.StatusMissing}, fmt.Errorf("model catalog is unavailable")
+	}
+	return t.catalog.Refresh(ctx)
 }

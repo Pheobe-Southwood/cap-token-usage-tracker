@@ -6,148 +6,193 @@ import (
 	"time"
 )
 
-func nightPrice() ModelPrice {
-	return ModelPrice{Input: 4, TimeZone: "Asia/Shanghai", TimeTiers: []TimePriceTier{{Name: "night", Days: []int{1}, Start: "23:00", End: "08:00", TokenRates: TokenRates{Input: 1, Output: 2, CacheRead: 0.5, CacheCreation: 0.25}}}}
+func at(t *testing.T, value string) time.Time {
+	t.Helper()
+	stamp, err := time.Parse(time.RFC3339, value)
+	if err != nil {
+		t.Fatalf("parse %s: %v", value, err)
+	}
+	return stamp
 }
-func TestTimePricingBoundaries(t *testing.T) {
-	price := nightPrice()
-	for _, tc := range []struct {
+
+func weekdayTier(name, start, end string, days ...int) TimePriceTier {
+	return TimePriceTier{
+		Name:      name,
+		Days:      days,
+		Start:     start,
+		End:       end,
+		Input:     timeRate(0.30),
+		Output:    timeRate(1.20),
+		CacheRead: timeRate(0.006),
+	}
+}
+
+func TestSelectTimeTierBoundaries(t *testing.T) {
+	tiers := []TimePriceTier{
+		weekdayTier("peak-morning", "01:00", "04:00", 1, 2, 3, 4, 5),
+		weekdayTier("peak-day", "06:00", "10:00", 1, 2, 3, 4, 5),
+	}
+	for _, testCase := range []struct {
 		stamp string
 		hit   bool
 	}{
-		{"2026-09-14T22:59:59+08:00", false}, {"2026-09-14T23:00:00+08:00", true},
-		{"2026-09-15T07:59:59+08:00", true}, {"2026-09-15T08:00:00+08:00", false},
-		{"2026-09-16T02:00:00+08:00", false},
+		{"2026-10-19T00:59:00Z", false}, // Monday, just before the window
+		{"2026-10-19T01:00:00Z", true},
+		{"2026-10-19T03:59:59Z", true},
+		{"2026-10-19T04:00:00Z", false},
+		{"2026-10-19T05:59:00Z", false},
+		{"2026-10-19T06:00:00Z", true},
+		{"2026-10-19T09:59:59Z", true},
+		{"2026-10-19T10:00:00Z", false},
+		{"2026-10-17T02:00:00Z", false}, // Saturday
+		{"2026-10-18T02:00:00Z", false}, // Sunday
+		{"2026-10-16T02:00:00Z", true},  // Friday
 	} {
-		stamp, _ := time.Parse(time.RFC3339, tc.stamp)
-		_, hit := selectTimePriceTier(price, stamp)
-		if hit != tc.hit {
-			t.Errorf("%s hit=%v", tc.stamp, hit)
+		_, hit := selectTimeTier("UTC", tiers, at(t, testCase.stamp))
+		if hit != testCase.hit {
+			t.Errorf("%s hit = %v, want %v", testCase.stamp, hit, testCase.hit)
 		}
 	}
-	price.TimeTiers[0].Days = []int{7}
-	stamp, _ := time.Parse(time.RFC3339, "2026-09-14T02:00:00+08:00")
-	if _, hit := selectTimePriceTier(price, stamp); !hit {
-		t.Fatal("Sunday overnight must include Monday morning")
+	if _, hit := selectTimeTier("", tiers, at(t, "2026-10-19T02:00:00Z")); !hit {
+		t.Fatal("an empty zone must fall back to UTC")
 	}
-	price.TimeZone = "America/Los_Angeles"
-	price.TimeTiers[0].Days = nil
-	price.TimeTiers[0].Start = "01:00"
-	price.TimeTiers[0].End = "02:00"
-	for _, s := range []string{"2026-11-01T08:30:00Z", "2026-11-01T09:30:00Z"} {
-		stamp, _ := time.Parse(time.RFC3339, s)
-		if _, hit := selectTimePriceTier(price, stamp); !hit {
-			t.Fatal("DST repeated hour", s)
+	if _, hit := selectTimeTier("UTC", nil, at(t, "2026-10-19T02:00:00Z")); hit {
+		t.Fatal("no tiers must never match")
+	}
+	if _, hit := selectTimeTier("UTC", tiers, time.Time{}); hit {
+		t.Fatal("a zero instant must never match")
+	}
+	if _, hit := selectTimeTier("Local", tiers, at(t, "2026-10-19T02:00:00Z")); hit {
+		t.Fatal("the machine zone must never match")
+	}
+	if _, hit := selectTimeTier("bad/zone", tiers, at(t, "2026-10-19T02:00:00Z")); hit {
+		t.Fatal("an unknown zone must never match")
+	}
+	if _, hit := selectTimeTier("UTC", []TimePriceTier{{Name: "bad", Start: "24:00", End: "25:00"}}, at(t, "2026-10-19T02:00:00Z")); hit {
+		t.Fatal("a malformed stored tier must never match")
+	}
+}
+
+func TestSelectTimeTierOvernightBelongsToStartDay(t *testing.T) {
+	tiers := []TimePriceTier{weekdayTier("night", "23:00", "08:00", 7)}
+	for _, testCase := range []struct {
+		stamp string
+		hit   bool
+	}{
+		{"2026-10-18T22:59:00+08:00", false}, // Sunday before the window
+		{"2026-10-18T23:00:00+08:00", true},
+		{"2026-10-19T07:59:59+08:00", true}, // Monday morning belongs to Sunday
+		{"2026-10-19T08:00:00+08:00", false},
+		{"2026-10-17T23:30:00+08:00", false}, // Saturday night is not Sunday
+	} {
+		_, hit := selectTimeTier("Asia/Shanghai", tiers, at(t, testCase.stamp))
+		if hit != testCase.hit {
+			t.Errorf("%s hit = %v, want %v", testCase.stamp, hit, testCase.hit)
 		}
 	}
 }
-func TestTimePricingValidation(t *testing.T) {
+
+func TestSelectTimeTierAcrossDaylightSaving(t *testing.T) {
+	// 2026-11-01 in New York repeats 01:00-02:00; both passes must match.
+	repeated := []TimePriceTier{weekdayTier("repeat", "01:00", "02:00")}
+	for _, stamp := range []string{"2026-11-01T05:30:00Z", "2026-11-01T06:30:00Z"} {
+		if _, hit := selectTimeTier("America/New_York", repeated, at(t, stamp)); !hit {
+			t.Fatalf("repeated DST hour %s did not match", stamp)
+		}
+	}
+	// 2026-03-08 skips 02:00-03:00; the surrounding instants must not match.
+	skipped := []TimePriceTier{weekdayTier("skipped", "02:00", "03:00")}
+	for _, stamp := range []string{"2026-03-08T06:59:00Z", "2026-03-08T07:00:00Z"} {
+		if _, hit := selectTimeTier("America/New_York", skipped, at(t, stamp)); hit {
+			t.Fatalf("skipped DST hour %s matched", stamp)
+		}
+	}
+}
+
+func TestNormalizeTimePricing(t *testing.T) {
+	valid := ModelPrice{TimeZone: "Asia/Shanghai", TimeTiers: []TimePriceTier{weekdayTier("night", "23:00", "08:00", 1)}}
+	if _, err := normalizeModelPrice("m", valid); err != nil {
+		t.Fatalf("valid schedule rejected: %v", err)
+	}
 	for name, mutate := range map[string]func(*ModelPrice){
-		"zone": func(p *ModelPrice) { p.TimeZone = "bad/zone" }, "local": func(p *ModelPrice) { p.TimeZone = "Local" },
-		"clock": func(p *ModelPrice) { p.TimeTiers[0].Start = "24:00" }, "equal": func(p *ModelPrice) { p.TimeTiers[0].End = "23:00" },
-		"day": func(p *ModelPrice) { p.TimeTiers[0].Days = []int{0} }, "duplicate day": func(p *ModelPrice) { p.TimeTiers[0].Days = []int{1, 1} },
-		"rate": func(p *ModelPrice) { p.TimeTiers[0].Input = math.NaN() },
+		"zone":           func(p *ModelPrice) { p.TimeZone = "bad/zone" },
+		"local":          func(p *ModelPrice) { p.TimeZone = "Local" },
+		"clock":          func(p *ModelPrice) { p.TimeTiers[0].Start = "24:00" },
+		"short clock":    func(p *ModelPrice) { p.TimeTiers[0].End = "8:00" },
+		"equal":          func(p *ModelPrice) { p.TimeTiers[0].End = "23:00" },
+		"day zero":       func(p *ModelPrice) { p.TimeTiers[0].Days = []int{0} },
+		"day eight":      func(p *ModelPrice) { p.TimeTiers[0].Days = []int{8} },
+		"duplicate day":  func(p *ModelPrice) { p.TimeTiers[0].Days = []int{1, 1} },
+		"empty name":     func(p *ModelPrice) { p.TimeTiers[0].Name = "  " },
+		"duplicate name": func(p *ModelPrice) { p.TimeTiers = append(p.TimeTiers, weekdayTier("night", "09:00", "10:00")) },
+		"newline name":   func(p *ModelPrice) { p.TimeTiers[0].Name = "bad\nname" },
+		"nan rate":       func(p *ModelPrice) { p.TimeTiers[0].Input = timeRate(math.NaN()) },
+		"negative rate":  func(p *ModelPrice) { p.TimeTiers[0].Output = timeRate(-1) },
+		"huge rate":      func(p *ModelPrice) { p.TimeTiers[0].Input = timeRate(maxModelPriceValue + 1) },
 		"overlap": func(p *ModelPrice) {
-			p.TimeTiers = append(p.TimeTiers, TimePriceTier{Name: "next", Days: []int{2}, Start: "07:00", End: "09:00"})
+			p.TimeTiers = append(p.TimeTiers, weekdayTier("next", "23:30", "23:45", 1))
+		},
+		"overnight overlap": func(p *ModelPrice) {
+			p.TimeTiers = []TimePriceTier{
+				weekdayTier("night", "23:00", "08:00", 1),
+				weekdayTier("next", "07:00", "09:00", 2),
+			}
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
-			p := nightPrice()
-			mutate(&p)
-			if _, err := normalizeModelPrice("m", p); err == nil {
-				t.Fatal("accepted invalid config")
+			price := ModelPrice{TimeZone: "Asia/Shanghai", TimeTiers: []TimePriceTier{weekdayTier("night", "23:00", "08:00", 1)}}
+			mutate(&price)
+			if _, err := normalizeModelPrice("m", price); err == nil {
+				t.Fatal("accepted an invalid schedule")
 			}
 		})
 	}
-	p := nightPrice()
-	p.TimeZone = ""
-	normalized, err := normalizeModelPrice("m", p)
+	if _, err := normalizeModelPrice("m", ModelPrice{TimeTiers: make([]TimePriceTier, maxTimePriceTiers+1)}); err == nil {
+		t.Fatal("accepted too many tiers")
+	}
+
+	// A schedule without a zone defaults to UTC; a zone without a schedule is
+	// dropped so an empty override stays empty.
+	normalized, err := normalizeModelPrice("m", ModelPrice{TimeTiers: []TimePriceTier{weekdayTier("night", "23:00", "08:00")}})
 	if err != nil || normalized.TimeZone != "UTC" {
-		t.Fatal(normalized, err)
+		t.Fatalf("zone default = %+v, %v", normalized, err)
 	}
-	copy := cloneModelPrices(map[string]ModelPrice{"m": p})
-	v := copy["m"]
-	v.TimeTiers[0].Days[0] = 2
-	if p.TimeTiers[0].Days[0] != 1 || sameEditableModelPrice(p, v) {
-		t.Fatal("copy/equality ignores days")
+	normalized, err = normalizeModelPrice("m", ModelPrice{TimeZone: "Asia/Shanghai"})
+	if err != nil || normalized.TimeZone != "" || !normalized.Empty() {
+		t.Fatalf("zone without schedule = %+v, %v", normalized, err)
 	}
-}
-func TestTimePricingCostPrecedence(t *testing.T) {
-	p := nightPrice()
-	p.ServiceTiers = map[string]ServiceTierPrice{"priority": {Input: 10, ContextTiers: []ContextPriceTier{{Threshold: 2000000, Input: 20}}}}
-	stamp, _ := time.Parse(time.RFC3339, "2026-09-14T23:00:00+08:00")
-	req := RequestDetail{Time: stamp, Dimensions: Dimensions{Model: "m", ServiceTier: "priority"}, Counters: Counters{InputTokens: 1000000}}
-	cost := estimateRequestCost(req, map[string]ModelPrice{"m": p})
-	if cost.TotalUSD != 1 || cost.PriceTimeTier != "night" {
-		t.Fatal(cost)
-	}
-	req.InputTokens = 3000000
-	cost = estimateRequestCost(req, map[string]ModelPrice{"m": p})
-	if cost.TotalUSD != 60 || cost.PriceTimeTier != "" {
-		t.Fatal(cost)
-	}
-	req.Time = stamp.Add(12 * time.Hour)
-	req.InputTokens = 1000000
-	cost = estimateRequestCost(req, map[string]ModelPrice{"m": p})
-	if cost.TotalUSD != 10 {
-		t.Fatal(cost)
+
+	// Tiers are deep copied so callers cannot alias the stored weekday slices.
+	original := ModelPrice{TimeZone: "UTC", TimeTiers: []TimePriceTier{weekdayTier("night", "23:00", "08:00", 1)}}
+	cloned := cloneModelPriceOverrides(map[string]ModelPrice{"m": original})
+	mutated := cloned["m"]
+	mutated.TimeTiers[0].Days[0] = 5
+	if original.TimeTiers[0].Days[0] != 1 {
+		t.Fatal("cloneModelPriceOverrides shares weekday slices")
 	}
 }
-func TestTimePricingPersistenceSyncAndCache(t *testing.T) {
-	config := testConfig(t)
-	config.SyncOnRecord = true
-	store, err := openStore(config)
-	if err != nil {
-		t.Fatal(err)
+
+func TestBuiltinTimePlansAreValid(t *testing.T) {
+	for model, plan := range builtinTimePlans {
+		if _, err := normalizeModelPrice(model, plan); err != nil {
+			t.Fatalf("builtin plan %s is invalid: %v", model, err)
+		}
 	}
-	defer func() { store.Close() }()
-	now := time.Now().UTC()
-	p := nightPrice()
-	p.TimeZone = "UTC"
-	p.TimeTiers[0].Days = nil
-	// This one-minute window always contains the recorded instant, including midnight.
-	p.TimeTiers[0].Start = now.Format("15:04")
-	p.TimeTiers[0].End = now.Add(time.Minute).Format("15:04")
-	book, err := store.SavePriceBook(map[string]ModelPrice{"m": p}, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := store.Record(normalizedUsage{RequestedAt: now, Dimensions: Dimensions{Model: "m"}, Counters: Counters{Requests: 1, InputTokens: 1000000}}); err != nil {
-		t.Fatal(err)
-	}
-	costs, err := store.QueryCosts("24h")
-	if err != nil || costs.Summary.TotalUSD != 1 {
-		t.Fatal(costs, err)
-	}
-	p.TimeTiers[0].Input = 2
-	book, err = store.SavePriceBook(map[string]ModelPrice{"m": p}, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	costs, err = store.QueryCosts("24h")
-	if err != nil || costs.Summary.TotalUSD != 2 {
-		t.Fatal(costs, err)
-	}
-	book, err = store.ApplyModelPriceSync(map[string]ModelPrice{"m": {Input: 99, Source: priceSourceModelsDev}}, book.SyncSettings, PriceSyncMetadata{}, book.Revision)
-	if err != nil || book.Prices["m"].TimeTiers[0].Input != 2 || book.LastSync.SkippedManual != 1 {
-		t.Fatal(book, err)
-	}
-	backup, backupErr := store.Backup()
-	if backupErr != nil {
-		t.Fatal(backupErr)
-	}
-	if err := store.RestoreBackup(backup); err != nil {
-		t.Fatal(err)
-	}
-	if err = store.Close(); err != nil {
-		t.Fatal(err)
-	}
-	store, err = openStore(config)
-	if err != nil {
-		t.Fatal(err)
-	}
-	book, err = store.QueryPriceBook()
-	if err != nil || book.Prices["m"].TimeZone != "UTC" || len(book.Prices["m"].TimeTiers) != 1 {
-		t.Fatal(book, err)
+}
+
+func TestNormalizeTimePlanModelID(t *testing.T) {
+	for input, want := range map[string]string{
+		"DeepSeek-V4.1-Flash":          "deepseek-v4.1-flash",
+		"deepseek/deepseek-v4.1-flash": "deepseek-v4.1-flash",
+		"deepseek-v4.1-flash:free":     "deepseek-v4.1-flash",
+		"openai/gpt-6-luna@20261017":   "gpt-6-luna",
+		"deepseek-v4-pro":              "deepseek-v4-pro",
+		"  DeepSeek-V4-Pro  ":          "deepseek-v4-pro",
+		"a/b/c":                        "c",
+		"":                             "",
+	} {
+		if got := normalizeTimePlanModelID(input); got != want {
+			t.Errorf("normalizeTimePlanModelID(%q) = %q, want %q", input, got, want)
+		}
 	}
 }

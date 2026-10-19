@@ -7,7 +7,10 @@ import (
 	"testing"
 )
 
-func TestTimePricingEditorInBrowser(t *testing.T) {
+// TestDashboardModelsTabInBrowser drives the models tab against a mock host:
+// tab order, the derived cost card, the per-row price dialog and the catalog
+// refresh flow.
+func TestDashboardModelsTabInBrowser(t *testing.T) {
 	node, err := exec.LookPath("node")
 	if err != nil {
 		browserTestUnavailable(t, "Node.js", err)
@@ -21,13 +24,13 @@ func TestTimePricingEditorInBrowser(t *testing.T) {
 	}
 
 	htmlPath := filepath.Join(t.TempDir(), "dashboard.html")
-	if err := os.WriteFile(htmlPath, []byte(fullDashboardHTML), 0o600); err != nil {
-		t.Fatalf("write full dashboard response body: %v", err)
+	if err := os.WriteFile(htmlPath, []byte(dashboardHTML), 0o600); err != nil {
+		t.Fatalf("write dashboard response body: %v", err)
 	}
 
-	command := exec.Command(node, filepath.Join("..", "..", "test", "dashboard_time_pricing.mjs"), htmlPath, chrome)
+	command := exec.Command(node, filepath.Join("..", "..", "test", "dashboard_models_tab.mjs"), htmlPath, chrome)
 	command.Env = append(os.Environ(), "TZ=UTC")
 	if output, err := command.CombinedOutput(); err != nil {
-		t.Fatalf("time pricing browser regression failed: %v\n%s\nInstall the pinned browser-test dependency with `npm ci`; this test uses the installed Google Chrome and does not download a browser.", err, output)
+		t.Fatalf("models tab browser regression failed: %v\n%s\nInstall the pinned browser-test dependency with `npm ci`; this test uses the installed Google Chrome and does not download a browser.", err, output)
 	}
 }

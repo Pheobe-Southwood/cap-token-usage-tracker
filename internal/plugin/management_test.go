@@ -2,13 +2,12 @@ package plugin
 
 import (
 	"encoding/json"
+	"math"
 	"net/http"
-	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -34,14 +33,14 @@ func TestManagementRegistrationUsesDynamicPluginID(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(registration.Routes) != 8 || registration.Routes[0].Method != http.MethodPost || registration.Routes[0].Path != "/plugins/custom-id/full-mode/session" || registration.Routes[1].Path != "/plugins/custom-id/stats" || registration.Routes[2].Method != http.MethodPost || registration.Routes[2].Path != "/plugins/custom-id/preferences" || registration.Routes[3].Method != http.MethodPost || registration.Routes[3].Path != "/plugins/custom-id/reset" || registration.Routes[4].Method != http.MethodPut || registration.Routes[4].Path != "/plugins/custom-id/prices" || registration.Routes[5].Path != "/plugins/custom-id/prices/sync" || registration.Routes[6].Method != http.MethodGet || registration.Routes[6].Path != "/plugins/custom-id/backup" || registration.Routes[7].Method != http.MethodPost || registration.Routes[7].Path != "/plugins/custom-id/restore" || len(registration.Resources) != 20 {
+	if len(registration.Routes) != 9 || registration.Routes[0].Method != http.MethodPost || registration.Routes[0].Path != "/plugins/custom-id/session" || registration.Routes[1].Path != "/plugins/custom-id/session/revoke" || registration.Routes[2].Method != http.MethodPut || registration.Routes[2].Path != "/plugins/custom-id/api-key-labels" || registration.Routes[3].Path != "/plugins/custom-id/stats" || registration.Routes[4].Method != http.MethodPost || registration.Routes[4].Path != "/plugins/custom-id/preferences" || registration.Routes[5].Method != http.MethodPut || registration.Routes[5].Path != "/plugins/custom-id/model-prices" || registration.Routes[6].Method != http.MethodPost || registration.Routes[6].Path != "/plugins/custom-id/reset" || registration.Routes[7].Method != http.MethodGet || registration.Routes[7].Path != "/plugins/custom-id/backup" || registration.Routes[8].Method != http.MethodPost || registration.Routes[8].Path != "/plugins/custom-id/restore" || len(registration.Resources) != 9 {
 		t.Fatalf("unexpected registration: %+v", registration)
 	}
 	resourcePaths := make(map[string]bool, len(registration.Resources))
 	for _, resource := range registration.Resources {
 		resourcePaths[resource.Path] = true
 	}
-	for _, path := range []string{"/dashboard", "/full-dashboard", "/full-mode/data", "/full-mode/api-key-labels", "/full-mode/session/revoke", "/full-mode/prices", "/full-mode/prices/save", "/full-mode/prices/sync", "/full-mode/backup", "/full-mode/restore", "/full-mode/reset", "/stats", "/stats/initial", "/stats/trends", "/stats/groups", "/requests", "/costs", "/exchange-rate", "/prices", "/preferences"} {
+	for _, path := range []string{"/dashboard", "/stats", "/stats/initial", "/stats/trends", "/stats/groups", "/requests", "/preferences", "/stats/models", "/model-prices"} {
 		if !resourcePaths[path] {
 			t.Fatalf("registration missing resource %q: %+v", path, registration.Resources)
 		}
@@ -54,11 +53,19 @@ func TestManagementRegistrationUsesDynamicPluginID(t *testing.T) {
 func TestCompactStatsResourcesShapePagingAndMethods(t *testing.T) {
 	config := testConfig(t)
 	config.SyncOnRecord = true
+	config.PricingCatalogURL = ""
 	store, err := openStore(config)
 	if err != nil {
 		t.Fatal(err)
 	}
 	runtime := &pluginRuntime{store: store, config: config}
+	// A real pricing table plus explicit overrides keeps the cost assertions
+	// independent of the embedded catalog.
+	pricing, err := newPricingTableFor(config, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime.pricing = pricing
 	defer runtime.shutdown()
 	registration, err := json.Marshal(pluginapi.ManagementRegistrationRequest{ResourceBasePath: "/v0/resource/plugins/test"})
 	if err != nil {
@@ -69,9 +76,9 @@ func TestCompactStatsResourcesShapePagingAndMethods(t *testing.T) {
 	}
 	now := nowUTC().Truncate(5 * time.Minute)
 	for _, usage := range []normalizedUsage{
-		{Dimensions: Dimensions{Provider: "openai", Model: "alpha", Source: "cli"}, RequestedAt: now.Add(-4 * time.Minute), Counters: Counters{Requests: 2, TotalTokens: 20}},
-		{Dimensions: Dimensions{Provider: "anthropic", Model: "beta", Source: "cli"}, RequestedAt: now.Add(-3 * time.Minute), Counters: Counters{Requests: 1, TotalTokens: 10}},
-		{Dimensions: Dimensions{Provider: "openai", Model: "alpha", Source: "web"}, RequestedAt: now.Add(-2 * time.Minute), Counters: Counters{Requests: 3, TotalTokens: 30}},
+		{Dimensions: Dimensions{Provider: "openai", Model: "alpha", Source: "cli"}, RequestedAt: now.Add(-4 * time.Minute), Counters: Counters{Requests: 2, InputTokens: 20, TotalTokens: 20}},
+		{Dimensions: Dimensions{Provider: "anthropic", Model: "beta", Source: "cli"}, RequestedAt: now.Add(-3 * time.Minute), Counters: Counters{Requests: 1, InputTokens: 10, TotalTokens: 10}},
+		{Dimensions: Dimensions{Provider: "openai", Model: "alpha", Source: "web"}, RequestedAt: now.Add(-2 * time.Minute), Counters: Counters{Requests: 3, InputTokens: 30, TotalTokens: 30}},
 	} {
 		if err := store.Record(usage); err != nil {
 			t.Fatal(err)
@@ -83,7 +90,7 @@ func TestCompactStatsResourcesShapePagingAndMethods(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		response, err := runtime.handleManagement(raw)
+		response, err := authedCall(t, runtime, raw)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -95,8 +102,61 @@ func TestCompactStatsResourcesShapePagingAndMethods(t *testing.T) {
 		t.Fatalf("initial response = %+v", initialResponse)
 	}
 	var initial InitialStatsResponse
-	if err := json.Unmarshal(initialResponse.Body, &initial); err != nil || initial.SchemaVersion != 2 || initial.BucketSeconds != 300 || initial.Summary.TotalTokens != 60 || len(initial.Models) != 2 || len(initial.Series) != 1 {
+	if err := json.Unmarshal(initialResponse.Body, &initial); err != nil || initial.SchemaVersion != 3 || initial.Scale != seriesScaleHour || initial.BucketSeconds != 3600 || initial.Summary.TotalTokens != 60 || len(initial.Models) != 2 || len(initial.Series) < 24 || len(initial.Series) > 26 || len(initial.CostSeries) != len(initial.Series) {
 		t.Fatalf("initial payload = %+v, %v", initial, err)
+	}
+	// Pricing the fixture models through the compatibility route must add the
+	// stacked histogram split to the same response.
+	for _, price := range []url.Values{
+		{"save": {"1"}, "model": {"alpha"}, "input": {"2"}, "output": {"2"}},
+		{"save": {"1"}, "model": {"beta"}, "input": {"1"}, "output": {"1"}},
+	} {
+		if response := call(http.MethodGet, runtime.routes.resourceModelPricesPath, price); response.StatusCode != http.StatusOK {
+			t.Fatalf("price save response = %+v", response)
+		}
+	}
+	initialResponse = call(http.MethodGet, runtime.routes.resourceStatsInitialPath, query)
+	if err := json.Unmarshal(initialResponse.Body, &initial); err != nil {
+		t.Fatal(err)
+	}
+	if len(initial.CostByModel) != 2 || len(initial.CostByKey) != 0 {
+		t.Fatalf("cost breakdown = %d models / %d keys, want 2/0", len(initial.CostByModel), len(initial.CostByKey))
+	}
+	if initial.CostByModel[0].Key != "alpha" || initial.CostByModel[0].Others {
+		t.Fatalf("cost breakdown order = %+v", initial.CostByModel)
+	}
+	for _, entry := range initial.CostByModel {
+		if len(entry.Values) != len(initial.CostSeries) {
+			t.Fatalf("breakdown %q values = %d, want %d", entry.Key, len(entry.Values), len(initial.CostSeries))
+		}
+		var sum float64
+		for _, value := range entry.Values {
+			sum += value
+		}
+		if math.Abs(sum-entry.TotalUSD) > 1e-9 {
+			t.Fatalf("breakdown %q total %v != sum %v", entry.Key, entry.TotalUSD, sum)
+		}
+	}
+	// Bucket by bucket the stacked series must add up to the cost series.
+	for index, point := range initial.CostSeries {
+		var stacked float64
+		for _, entry := range initial.CostByModel {
+			stacked += entry.Values[index]
+		}
+		if math.Abs(stacked-point.CostUSD) > 1e-9 {
+			t.Fatalf("bucket %d stacked %v != cost series %v", index, stacked, point.CostUSD)
+		}
+	}
+	var breakdownTotal float64
+	for _, entry := range initial.CostByModel {
+		breakdownTotal += entry.TotalUSD
+	}
+	var seriesTotal float64
+	for _, point := range initial.CostSeries {
+		seriesTotal += point.CostUSD
+	}
+	if math.Abs(breakdownTotal-seriesTotal) > 1e-9 || math.Abs(breakdownTotal-initial.Cost.CostUSD) > 1e-9 {
+		t.Fatalf("breakdown %v != series %v != summary %v", breakdownTotal, seriesTotal, initial.Cost.CostUSD)
 	}
 	trendResponse := call(http.MethodGet, runtime.routes.resourceStatsTrendPath, query)
 	var trend StatsTrendResponse
@@ -130,7 +190,7 @@ func TestManagementStatsAndReset(t *testing.T) {
 		t.Fatal(err)
 	}
 	runtime := &pluginRuntime{store: store, config: config, routes: registeredRoutes{
-		pluginID: "test", statsPath: "/v0/management/plugins/test/stats", resetPath: "/v0/management/plugins/test/reset", dashboardPath: "/v0/resource/plugins/test/dashboard", resourceStatsPath: "/v0/resource/plugins/test/stats", resourceRequestsPath: "/v0/resource/plugins/test/requests", resourceCostsPath: "/v0/resource/plugins/test/costs", resourceExchangeRatePath: "/v0/resource/plugins/test/exchange-rate", pricesPath: "/v0/management/plugins/test/prices", priceSyncPath: "/v0/management/plugins/test/prices/sync", resourcePricesPath: "/v0/resource/plugins/test/prices", resourcePreferencesPath: "/v0/resource/plugins/test/preferences",
+		pluginID: "test", statsPath: "/v0/management/plugins/test/stats", resetPath: "/v0/management/plugins/test/reset", dashboardPath: "/v0/resource/plugins/test/dashboard", resourceStatsPath: "/v0/resource/plugins/test/stats", resourceRequestsPath: "/v0/resource/plugins/test/requests", resourcePreferencesPath: "/v0/resource/plugins/test/preferences",
 	}}
 	defer runtime.shutdown()
 	if err := store.Record(normalizedUsage{Dimensions: Dimensions{Model: "m"}, RequestedAt: nowUTC(), Counters: Counters{Requests: 1, TotalTokens: 3}}); err != nil {
@@ -138,7 +198,7 @@ func TestManagementStatsAndReset(t *testing.T) {
 	}
 
 	statsRequest, _ := json.Marshal(pluginapi.ManagementRequest{Method: http.MethodGet, Path: runtime.routes.statsPath, Query: url.Values{"range": []string{"24h"}}})
-	response, err := runtime.handleManagement(statsRequest)
+	response, err := authedCall(t, runtime, statsRequest)
 	if err != nil || response.StatusCode != http.StatusOK {
 		t.Fatalf("stats response: %+v, %v", response, err)
 	}
@@ -150,7 +210,7 @@ func TestManagementStatsAndReset(t *testing.T) {
 	}
 
 	resourceStatsRequest, _ := json.Marshal(pluginapi.ManagementRequest{Method: http.MethodGet, Path: runtime.routes.resourceStatsPath, Query: url.Values{"range": []string{"24h"}}})
-	response, err = runtime.handleManagement(resourceStatsRequest)
+	response, err = authedCall(t, runtime, resourceStatsRequest)
 	if err != nil || response.StatusCode != http.StatusOK || !strings.Contains(string(response.Body), `"total_tokens":3`) {
 		t.Fatalf("resource stats response: %+v, %v", response, err)
 	}
@@ -160,30 +220,30 @@ func TestManagementStatsAndReset(t *testing.T) {
 		"end":   []string{time.Now().Add(time.Hour).Format(time.RFC3339)},
 	}
 	customStatsRequest, _ := json.Marshal(pluginapi.ManagementRequest{Method: http.MethodGet, Path: runtime.routes.resourceStatsPath, Query: customQuery})
-	response, err = runtime.handleManagement(customStatsRequest)
+	response, err = authedCall(t, runtime, customStatsRequest)
 	if err != nil || response.StatusCode != http.StatusOK || !strings.Contains(string(response.Body), `"range":"custom"`) || !strings.Contains(string(response.Body), `"total_tokens":3`) {
 		t.Fatalf("custom stats response: %+v, %v", response, err)
 	}
 	invalidRangeRequest, _ := json.Marshal(pluginapi.ManagementRequest{Method: http.MethodGet, Path: runtime.routes.resourceStatsPath, Query: url.Values{"range": []string{"custom"}, "start": []string{time.Now().Format(time.RFC3339)}}})
-	response, err = runtime.handleManagement(invalidRangeRequest)
+	response, err = authedCall(t, runtime, invalidRangeRequest)
 	if err != nil || response.StatusCode != http.StatusBadRequest {
 		t.Fatalf("invalid custom range response: %+v, %v", response, err)
 	}
 
 	requestsRequest, _ := json.Marshal(pluginapi.ManagementRequest{Method: http.MethodGet, Path: runtime.routes.resourceRequestsPath, Query: url.Values{"range": []string{"24h"}, "offset": []string{"0"}, "limit": []string{"20"}, "model": []string{"m"}}})
-	response, err = runtime.handleManagement(requestsRequest)
+	response, err = authedCall(t, runtime, requestsRequest)
 	if err != nil || response.StatusCode != http.StatusOK || !strings.Contains(string(response.Body), `"total":1`) || !strings.Contains(string(response.Body), `"model":"m"`) {
 		t.Fatalf("resource requests response: %+v, %v", response, err)
 	}
 	requestsResultQuery := url.Values{"range": []string{"24h"}, "result": []string{"failed"}}
 	requestsResultRequest, _ := json.Marshal(pluginapi.ManagementRequest{Method: http.MethodGet, Path: runtime.routes.resourceRequestsPath, Query: requestsResultQuery})
-	response, err = runtime.handleManagement(requestsResultRequest)
+	response, err = authedCall(t, runtime, requestsResultRequest)
 	if err != nil || response.StatusCode != http.StatusOK || !strings.Contains(string(response.Body), `"total":0`) {
 		t.Fatalf("filtered resource requests response: %+v, %v", response, err)
 	}
 	requestsResultQuery.Set("result", "unknown")
 	requestsResultRequest, _ = json.Marshal(pluginapi.ManagementRequest{Method: http.MethodGet, Path: runtime.routes.resourceRequestsPath, Query: requestsResultQuery})
-	response, err = runtime.handleManagement(requestsResultRequest)
+	response, err = authedCall(t, runtime, requestsResultRequest)
 	if err != nil || response.StatusCode != http.StatusBadRequest {
 		t.Fatalf("invalid request result response: %+v, %v", response, err)
 	}
@@ -195,140 +255,47 @@ func TestManagementStatsAndReset(t *testing.T) {
 	customRequestsQuery.Set("limit", "20")
 	customRequestsQuery.Set("model", "m")
 	customRequestsRequest, _ := json.Marshal(pluginapi.ManagementRequest{Method: http.MethodGet, Path: runtime.routes.resourceRequestsPath, Query: customRequestsQuery})
-	response, err = runtime.handleManagement(customRequestsRequest)
+	response, err = authedCall(t, runtime, customRequestsRequest)
 	if err != nil || response.StatusCode != http.StatusOK || !strings.Contains(string(response.Body), `"range":"custom"`) || !strings.Contains(string(response.Body), `"total":1`) {
 		t.Fatalf("custom requests response: %+v, %v", response, err)
 	}
 
-	pricesRequest, _ := json.Marshal(pluginapi.ManagementRequest{Method: http.MethodGet, Path: runtime.routes.resourcePricesPath})
-	response, err = runtime.handleManagement(pricesRequest)
-	if err != nil || response.StatusCode != http.StatusOK || !strings.Contains(string(response.Body), `"prices":{}`) {
-		t.Fatalf("empty prices response: %+v, %v", response, err)
-	}
 	preferencesRequest, _ := json.Marshal(pluginapi.ManagementRequest{Method: http.MethodGet, Path: runtime.routes.resourcePreferencesPath})
-	response, err = runtime.handleManagement(preferencesRequest)
+	response, err = authedCall(t, runtime, preferencesRequest)
 	if err != nil || response.StatusCode != http.StatusOK || !strings.Contains(string(response.Body), `"request_page_size":100`) || !strings.Contains(string(response.Body), `"hidden_request_columns":[]`) || !strings.Contains(string(response.Body), `"time_range_mode":"custom"`) {
 		t.Fatalf("default preferences response: %+v, %v", response, err)
 	}
 	savePreferencesRequest, _ := json.Marshal(pluginapi.ManagementRequest{Method: http.MethodGet, Path: runtime.routes.resourcePreferencesPath, Query: url.Values{"save": []string{"1"}, "request_page_size": []string{"50"}, "dimension_page_size": []string{"200"}, "hidden_request_column": []string{"source"}, "hidden_dimension_column": []string{"provider"}, "time_range_mode": []string{"last_7_days"}}})
-	response, err = runtime.handleManagement(savePreferencesRequest)
+	response, err = authedCall(t, runtime, savePreferencesRequest)
 	if err != nil || response.StatusCode != http.StatusOK || !strings.Contains(string(response.Body), `"request_page_size":50`) || !strings.Contains(string(response.Body), `"hidden_dimension_columns":["provider"]`) {
 		t.Fatalf("save preferences response: %+v, %v", response, err)
 	}
-	response, err = runtime.handleManagement(preferencesRequest)
+	response, err = authedCall(t, runtime, preferencesRequest)
 	if err != nil || response.StatusCode != http.StatusOK || !strings.Contains(string(response.Body), `"dimension_page_size":200`) || !strings.Contains(string(response.Body), `"hidden_request_columns":["source"]`) || !strings.Contains(string(response.Body), `"time_range_mode":"last_7_days"`) {
 		t.Fatalf("persisted preferences response: %+v, %v", response, err)
 	}
 
-	savePricesRequest, _ := json.Marshal(pluginapi.ManagementRequest{Method: http.MethodPut, Path: runtime.routes.pricesPath, Headers: http.Header{"Content-Type": []string{"application/json"}}, Body: []byte(`{"prices":{"m":{"input":2.5,"output":10}}}`)})
-	response, err = runtime.handleManagement(savePricesRequest)
-	if err != nil || response.StatusCode != http.StatusOK || !strings.Contains(string(response.Body), `"input":2.5`) {
-		t.Fatalf("save prices response: %+v, %v", response, err)
-	}
-	response, err = runtime.handleManagement(pricesRequest)
-	if err != nil || response.StatusCode != http.StatusOK || !strings.Contains(string(response.Body), `"output":10`) {
-		t.Fatalf("persisted prices response: %+v, %v", response, err)
-	}
-	costsRequest, _ := json.Marshal(pluginapi.ManagementRequest{Method: http.MethodGet, Path: runtime.routes.resourceCostsPath, Query: url.Values{"range": []string{"24h"}}})
-	response, err = runtime.handleManagement(costsRequest)
-	if err != nil || response.StatusCode != http.StatusOK || !strings.Contains(string(response.Body), `"priced_requests":1`) || !strings.Contains(string(response.Body), `"estimate_basis":"current_price_book"`) {
-		t.Fatalf("resource costs response: %+v, %v", response, err)
-	}
-	customCostsRequest, _ := json.Marshal(pluginapi.ManagementRequest{Method: http.MethodGet, Path: runtime.routes.resourceCostsPath, Query: customQuery})
-	response, err = runtime.handleManagement(customCostsRequest)
-	if err != nil || response.StatusCode != http.StatusOK || !strings.Contains(string(response.Body), `"range":"custom"`) || !strings.Contains(string(response.Body), `"priced_requests":1`) {
-		t.Fatalf("custom costs response: %+v, %v", response, err)
-	}
-	catalogServer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		writer.Header().Set("Content-Type", "application/json")
-		_, _ = writer.Write([]byte(`{"openai":{"models":{"m":{"cost":{"input":1,"output":2,"cache_read":0.1,"cache_write":1}}}}}`))
-	}))
-	defer catalogServer.Close()
-	runtime.modelsDevFetcher = &modelsDevFetcher{client: catalogServer.Client(), url: catalogServer.URL}
-	syncRequest, _ := json.Marshal(pluginapi.ManagementRequest{Method: http.MethodPost, Path: runtime.routes.priceSyncPath, Headers: http.Header{"Content-Type": []string{"application/json"}}, Body: []byte(`{"source":"models.dev","models":["m"]}`)})
-	response, err = runtime.handleManagement(syncRequest)
-	if err != nil || response.StatusCode != http.StatusOK || !strings.Contains(string(response.Body), `"skipped_manual":1`) {
-		t.Fatalf("price sync response: %+v, %v", response, err)
-	}
-	invalidPricesRequest, _ := json.Marshal(pluginapi.ManagementRequest{Method: http.MethodPut, Path: runtime.routes.pricesPath, Headers: http.Header{"Content-Type": []string{"application/json"}}, Body: []byte(`{"prices":{"m":{"input":-1,"output":10}}}`)})
-	response, _ = runtime.handleManagement(invalidPricesRequest)
-	if response.StatusCode != http.StatusBadRequest {
-		t.Fatalf("invalid prices status = %d body=%s", response.StatusCode, response.Body)
-	}
-	for _, body := range []string{
-		`{"prices":{},"unknown":true}`,
-		`{"prices":{"m":{"input":1,"unknown":true}}}`,
-		`{"prices":{}} {"prices":{}}`,
-		``,
-	} {
-		requestRaw, _ := json.Marshal(pluginapi.ManagementRequest{Method: http.MethodPut, Path: runtime.routes.pricesPath, Headers: http.Header{"Content-Type": []string{"application/json"}}, Body: []byte(body)})
-		response, _ = runtime.handleManagement(requestRaw)
-		if response.StatusCode != http.StatusBadRequest {
-			t.Fatalf("strict prices body %q status = %d body=%s", body, response.StatusCode, response.Body)
-		}
-	}
-	unknownSyncRequest, _ := json.Marshal(pluginapi.ManagementRequest{Method: http.MethodPost, Path: runtime.routes.priceSyncPath, Headers: http.Header{"Content-Type": []string{"application/json"}}, Body: []byte(`{"source":"models.dev","url":"https://example.com"}`)})
-	response, _ = runtime.handleManagement(unknownSyncRequest)
-	if response.StatusCode != http.StatusBadRequest {
-		t.Fatalf("unknown sync field status = %d body=%s", response.StatusCode, response.Body)
-	}
-
-	emptyModelsSyncRequest, _ := json.Marshal(pluginapi.ManagementRequest{Method: http.MethodPost, Path: runtime.routes.priceSyncPath, Headers: http.Header{"Content-Type": []string{"application/json"}}, Body: []byte(`{"source":"models.dev","models":[]}`)})
-	response, _ = runtime.handleManagement(emptyModelsSyncRequest)
-	if response.StatusCode != http.StatusBadRequest || !strings.Contains(string(response.Body), "at least one CLIProxyAPI model") {
-		t.Fatalf("empty sync models status = %d body=%s", response.StatusCode, response.Body)
-	}
-
 	badRequestsRequest, _ := json.Marshal(pluginapi.ManagementRequest{Method: http.MethodGet, Path: runtime.routes.resourceRequestsPath, Query: url.Values{"offset": []string{"bad"}}})
-	response, _ = runtime.handleManagement(badRequestsRequest)
+	response, _ = authedCall(t, runtime, badRequestsRequest)
 	if response.StatusCode != http.StatusBadRequest {
 		t.Fatalf("bad requests query status = %d", response.StatusCode)
 	}
 
 	looseContentType, _ := json.Marshal(pluginapi.ManagementRequest{Method: http.MethodPost, Path: runtime.routes.resetPath, Headers: http.Header{"Content-Type": []string{"application/jsonp"}}, Body: []byte(`{"confirm":"reset"}`)})
-	response, _ = runtime.handleManagement(looseContentType)
+	response, _ = authedCall(t, runtime, looseContentType)
 	if response.StatusCode != http.StatusUnsupportedMediaType {
 		t.Fatalf("loose content type status = %d", response.StatusCode)
 	}
 
 	badReset, _ := json.Marshal(pluginapi.ManagementRequest{Method: http.MethodPost, Path: runtime.routes.resetPath, Headers: http.Header{"Content-Type": []string{"application/json"}}, Body: []byte(`{"confirm":"no"}`)})
-	response, _ = runtime.handleManagement(badReset)
+	response, _ = authedCall(t, runtime, badReset)
 	if response.StatusCode != http.StatusBadRequest {
 		t.Fatalf("bad reset status = %d", response.StatusCode)
 	}
 	goodReset, _ := json.Marshal(pluginapi.ManagementRequest{Method: http.MethodPost, Path: runtime.routes.resetPath, Headers: http.Header{"Content-Type": []string{"application/json"}}, Body: []byte(`{"confirm":"reset"}`)})
-	response, _ = runtime.handleManagement(goodReset)
+	response, _ = authedCall(t, runtime, goodReset)
 	if response.StatusCode != http.StatusOK {
 		t.Fatalf("good reset status = %d body=%s", response.StatusCode, response.Body)
-	}
-}
-
-func TestSyncModelsDevUsesProvidedCLIModels(t *testing.T) {
-	config := testConfig(t)
-	store, err := openStore(config)
-	if err != nil {
-		t.Fatal(err)
-	}
-	runtime := &pluginRuntime{store: store, config: config}
-	defer runtime.shutdown()
-	if err := store.Record(normalizedUsage{Dimensions: Dimensions{Model: "usage-only"}, RequestedAt: time.Now().UTC(), Counters: Counters{Requests: 1}}); err != nil {
-		t.Fatal(err)
-	}
-	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		writer.Header().Set("Content-Type", "application/json")
-		_, _ = writer.Write([]byte(`{"openai":{"models":{"cli-only":{"cost":{"input":1,"output":2}},"usage-only":{"cost":{"input":9,"output":9}}}}}`))
-	}))
-	defer server.Close()
-	runtime.modelsDevFetcher = &modelsDevFetcher{client: server.Client(), url: server.URL}
-	response, err := runtime.syncModelsDev(nil, []string{"cli-only"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, ok := response.Prices["cli-only"]; !ok {
-		t.Fatalf("CLIProxyAPI model was not synchronized: %+v", response.Prices)
-	}
-	if _, ok := response.Prices["usage-only"]; ok {
-		t.Fatalf("usage-only model was synchronized: %+v", response.Prices)
 	}
 }
 
@@ -343,7 +310,7 @@ func TestDashboardPreferencesResourceValidation(t *testing.T) {
 
 	request := func(method string, query url.Values) pluginapi.ManagementResponse {
 		raw, _ := json.Marshal(pluginapi.ManagementRequest{Method: method, Path: runtime.routes.resourcePreferencesPath, Query: query})
-		response, handleErr := runtime.handleManagement(raw)
+		response, handleErr := authedCall(t, runtime, raw)
 		if handleErr != nil {
 			t.Fatal(handleErr)
 		}
@@ -361,7 +328,7 @@ func TestDashboardPreferencesResourceValidation(t *testing.T) {
 	if response := request(http.MethodGet, url.Values{"save": []string{"1"}, "request_page_size": []string{"100"}, "dimension_page_size": []string{"100"}, "unknown": []string{"value"}}); response.StatusCode != http.StatusBadRequest {
 		t.Fatalf("unknown query status = %d body=%s", response.StatusCode, response.Body)
 	}
-	if response := request(http.MethodGet, url.Values{"save": []string{"1"}, "request_page_size": []string{"100"}, "dimension_page_size": []string{"100"}, "time_range_mode": []string{"yesterday"}}); response.StatusCode != http.StatusBadRequest {
+	if response := request(http.MethodGet, url.Values{"save": []string{"1"}, "request_page_size": []string{"100"}, "dimension_page_size": []string{"100"}, "time_range_mode": []string{"fortnight"}}); response.StatusCode != http.StatusBadRequest {
 		t.Fatalf("invalid range mode status = %d body=%s", response.StatusCode, response.Body)
 	}
 	if response := request(http.MethodGet, url.Values{"save": []string{"1"}, "request_page_size": []string{"100"}, "dimension_page_size": []string{"100"}, "token_display_mode": []string{"billion"}}); response.StatusCode != http.StatusBadRequest {
@@ -375,105 +342,14 @@ func TestDashboardPreferencesResourceValidation(t *testing.T) {
 	}
 }
 
-func TestConcurrentPriceSyncReturnsConflict(t *testing.T) {
-	config := testConfig(t)
-	config.SyncOnRecord = true
-	store, err := openStore(config)
-	if err != nil {
-		t.Fatal(err)
-	}
-	runtime := &pluginRuntime{store: store, config: config, routes: registeredRoutes{pluginID: "test", priceSyncPath: "/v0/management/plugins/test/prices/sync"}}
-	defer runtime.shutdown()
-	if err := store.Record(normalizedUsage{Dimensions: Dimensions{Model: "m"}, RequestedAt: time.Now().UTC(), Counters: Counters{Requests: 1}}); err != nil {
-		t.Fatal(err)
-	}
-	started := make(chan struct{})
-	release := make(chan struct{})
-	var once sync.Once
-	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		once.Do(func() { close(started) })
-		<-release
-		writer.Header().Set("Content-Type", "application/json")
-		_, _ = writer.Write([]byte(`{"openai":{"models":{"m":{"cost":{"input":1,"output":2}}}}}`))
-	}))
-	defer server.Close()
-	runtime.modelsDevFetcher = &modelsDevFetcher{client: server.Client(), url: server.URL}
-	raw, _ := json.Marshal(pluginapi.ManagementRequest{Method: http.MethodPost, Path: runtime.routes.priceSyncPath, Headers: http.Header{"Content-Type": []string{"application/json"}}, Body: []byte(`{"source":"models.dev","models":["m"]}`)})
-	firstDone := make(chan pluginapi.ManagementResponse, 1)
-	go func() {
-		response, _ := runtime.handleManagement(raw)
-		firstDone <- response
-	}()
-	<-started
-	response, _ := runtime.handleManagement(raw)
-	if response.StatusCode != http.StatusConflict {
-		close(release)
-		t.Fatalf("concurrent sync status = %d body=%s", response.StatusCode, response.Body)
-	}
-	close(release)
-	if response = <-firstDone; response.StatusCode != http.StatusOK {
-		t.Fatalf("first sync status = %d body=%s", response.StatusCode, response.Body)
-	}
-	response, _ = runtime.handleManagement(raw)
-	if response.StatusCode != http.StatusOK {
-		t.Fatalf("later sync status = %d body=%s", response.StatusCode, response.Body)
-	}
-}
-
-func TestStalePriceSyncDoesNotOverwriteNewSettings(t *testing.T) {
-	config := testConfig(t)
-	config.SyncOnRecord = true
-	store, err := openStore(config)
-	if err != nil {
-		t.Fatal(err)
-	}
-	runtime := &pluginRuntime{store: store, config: config}
-	defer runtime.shutdown()
-	if err := store.Record(normalizedUsage{Dimensions: Dimensions{Model: "m"}, RequestedAt: time.Now().UTC(), Counters: Counters{Requests: 1}}); err != nil {
-		t.Fatal(err)
-	}
-	started := make(chan struct{})
-	release := make(chan struct{})
-	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		close(started)
-		<-release
-		writer.Header().Set("Content-Type", "application/json")
-		_, _ = writer.Write([]byte(`{"openai":{"models":{"m":{"cost":{"input":1}}}}}`))
-	}))
-	defer server.Close()
-	runtime.modelsDevFetcher = &modelsDevFetcher{client: server.Client(), url: server.URL}
-	done := make(chan error, 1)
-	go func() {
-		_, err := runtime.syncModelsDev(nil, []string{"m"})
-		done <- err
-	}()
-	<-started
-	newSettings := PriceSyncSettings{ProviderPriority: []string{"anthropic"}, IgnoredSuffixes: []string{"-custom"}}
-	if _, err := store.SavePriceBook(map[string]ModelPrice{}, &newSettings); err != nil {
-		close(release)
-		t.Fatal(err)
-	}
-	close(release)
-	if err := <-done; err == nil || errorHTTPStatus(err) != http.StatusConflict {
-		t.Fatalf("stale sync error = %v", err)
-	}
-	book, err := store.QueryPriceBook()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(book.SyncSettings.ProviderPriority) != 1 || book.SyncSettings.ProviderPriority[0] != "anthropic" || book.Revision != 1 {
-		t.Fatalf("new settings were overwritten: %+v", book)
-	}
-}
-
-func TestManagementSourceFilterAppliesToStatsRequestsAndCosts(t *testing.T) {
+func TestManagementSourceFilterAppliesToStatsAndRequests(t *testing.T) {
 	config := testConfig(t)
 	store, err := openStore(config)
 	if err != nil {
 		t.Fatal(err)
 	}
 	runtime := &pluginRuntime{store: store, config: config, routes: registeredRoutes{
-		pluginID: "test", resourceStatsPath: "/v0/resource/plugins/test/stats", resourceRequestsPath: "/v0/resource/plugins/test/requests", resourceCostsPath: "/v0/resource/plugins/test/costs",
+		pluginID: "test", resourceStatsPath: "/v0/resource/plugins/test/stats", resourceRequestsPath: "/v0/resource/plugins/test/requests",
 	}}
 	defer runtime.shutdown()
 	for _, usage := range []normalizedUsage{
@@ -485,13 +361,13 @@ func TestManagementSourceFilterAppliesToStatsRequestsAndCosts(t *testing.T) {
 		}
 	}
 	query := url.Values{"range": []string{"24h"}, "source": []string{"cli"}}
-	for _, path := range []string{runtime.routes.resourceStatsPath, runtime.routes.resourceRequestsPath, runtime.routes.resourceCostsPath} {
+	for _, path := range []string{runtime.routes.resourceStatsPath, runtime.routes.resourceRequestsPath} {
 		if path == runtime.routes.resourceRequestsPath {
 			query.Set("offset", "0")
 			query.Set("limit", "100")
 		}
 		request, _ := json.Marshal(pluginapi.ManagementRequest{Method: http.MethodGet, Path: path, Query: query})
-		response, err := runtime.handleManagement(request)
+		response, err := authedCall(t, runtime, request)
 		if err != nil || response.StatusCode != http.StatusOK || strings.Contains(string(response.Body), `"source":"web"`) {
 			t.Fatalf("source-filtered %s response: %+v, %v", path, response, err)
 		}
@@ -501,15 +377,6 @@ func TestManagementSourceFilterAppliesToStatsRequestsAndCosts(t *testing.T) {
 		if path == runtime.routes.resourceRequestsPath && !strings.Contains(string(response.Body), `"total":1`) {
 			t.Fatalf("source-filtered request response: %+v", response)
 		}
-		if path == runtime.routes.resourceCostsPath && !strings.Contains(string(response.Body), `"requests":1`) {
-			t.Fatalf("source-filtered cost response: %+v", response)
-		}
-	}
-
-	allCosts, _ := json.Marshal(pluginapi.ManagementRequest{Method: http.MethodGet, Path: runtime.routes.resourceCostsPath, Query: url.Values{"range": []string{"24h"}}})
-	response, err := runtime.handleManagement(allCosts)
-	if err != nil || response.StatusCode != http.StatusOK || !strings.Contains(string(response.Body), `"requests":2`) {
-		t.Fatalf("unfiltered costs response: %+v, %v", response, err)
 	}
 }
 
@@ -520,7 +387,7 @@ func TestManagementIgnoresLegacyAuthenticationIdentityParameters(t *testing.T) {
 		t.Fatal(err)
 	}
 	runtime := &pluginRuntime{store: store, config: config, routes: registeredRoutes{
-		pluginID: "test", resourceStatsPath: "/v0/resource/plugins/test/stats", resourceRequestsPath: "/v0/resource/plugins/test/requests", resourceCostsPath: "/v0/resource/plugins/test/costs",
+		pluginID: "test", resourceStatsPath: "/v0/resource/plugins/test/stats", resourceRequestsPath: "/v0/resource/plugins/test/requests",
 	}}
 	defer runtime.shutdown()
 	for _, usage := range []normalizedUsage{
@@ -532,13 +399,13 @@ func TestManagementIgnoresLegacyAuthenticationIdentityParameters(t *testing.T) {
 		}
 	}
 	query := url.Values{"range": []string{"24h"}, "source": []string{"Codex-user@example.com"}, "auth_provider": []string{"ignored"}, "auth_account": []string{"ignored"}}
-	for _, path := range []string{runtime.routes.resourceStatsPath, runtime.routes.resourceRequestsPath, runtime.routes.resourceCostsPath} {
+	for _, path := range []string{runtime.routes.resourceStatsPath, runtime.routes.resourceRequestsPath} {
 		if path == runtime.routes.resourceRequestsPath {
 			query.Set("offset", "0")
 			query.Set("limit", "100")
 		}
 		request, _ := json.Marshal(pluginapi.ManagementRequest{Method: http.MethodGet, Path: path, Query: query})
-		response, err := runtime.handleManagement(request)
+		response, err := authedCall(t, runtime, request)
 		if err != nil || response.StatusCode != http.StatusOK || strings.Contains(string(response.Body), "\"auth_provider\"") || strings.Contains(string(response.Body), "\"auth_account\"") {
 			t.Fatalf("identity-filtered %s response: %+v, %v", path, response, err)
 		}
@@ -548,12 +415,12 @@ func TestManagementIgnoresLegacyAuthenticationIdentityParameters(t *testing.T) {
 func TestDashboardSecurityContract(t *testing.T) {
 	response := dashboardResponse()
 	html := string(response.Body)
-	for _, required := range []string{"/v0/resource/plugins/", "/v0/management/plugins/", "Authorization", "type=\"password\"", "textContent", "replaceChildren", "load().catch"} {
+	for _, required := range []string{"/v0/resource/plugins/", "/v0/management/plugins/", "Authorization", "type=\"password\"", "textContent", "replaceChildren", "showError(error)", "X-Plugin-Session", "window.sessionStorage.setItem(sessionStoreKey"} {
 		if !strings.Contains(html, required) {
 			t.Fatalf("dashboard missing %q", required)
 		}
 	}
-	for _, forbidden := range []string{"localStorage", "sessionStorage", "connectButton", "logoutButton", "fetch('stats')", `fetch("stats")`} {
+	for _, forbidden := range []string{"localStorage", "document.cookie", "connectButton", "logoutButton", "fetch('stats')", `fetch("stats")`} {
 		if strings.Contains(html, forbidden) {
 			t.Fatalf("dashboard contains forbidden pattern %q", forbidden)
 		}
@@ -586,14 +453,9 @@ func TestManagementBackupAndRestore(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.SaveModelPrices(map[string]ModelPrice{
-		"backup-endpoint": {Input: 1.5, Output: 6},
-	}); err != nil {
-		t.Fatal(err)
-	}
 
 	backupRequest, _ := json.Marshal(pluginapi.ManagementRequest{Method: http.MethodGet, Path: runtime.routes.backupPath})
-	response, err := runtime.handleManagement(backupRequest)
+	response, err := authedCall(t, runtime, backupRequest)
 	if err != nil || response.StatusCode != http.StatusOK {
 		t.Fatalf("backup response: %+v, %v", response, err)
 	}
@@ -630,7 +492,7 @@ func TestManagementBackupAndRestore(t *testing.T) {
 			"X-Confirm-Restore": []string{"replace"},
 		},
 	})
-	response, err = runtime.handleManagement(emptyRestore)
+	response, err = authedCall(t, runtime, emptyRestore)
 	if err != nil || response.StatusCode != http.StatusBadRequest || !strings.Contains(string(response.Body), "backup body must not be empty") {
 		t.Fatalf("empty restore response: %+v, %v", response, err)
 	}
@@ -641,7 +503,7 @@ func TestManagementBackupAndRestore(t *testing.T) {
 		Headers: http.Header{"Content-Type": []string{"application/json"}},
 		Body:    []byte("not-a-database"),
 	})
-	response, err = runtime.handleManagement(invalidTypeRestore)
+	response, err = authedCall(t, runtime, invalidTypeRestore)
 	if err != nil || response.StatusCode != http.StatusUnsupportedMediaType || !strings.Contains(string(response.Body), "application/octet-stream") {
 		t.Fatalf("invalid content type restore response: %+v, %v", response, err)
 	}
@@ -652,7 +514,7 @@ func TestManagementBackupAndRestore(t *testing.T) {
 		Headers: http.Header{"Content-Type": []string{"application/octet-stream"}},
 		Body:    backupBody,
 	})
-	response, err = runtime.handleManagement(missingConfirmRestore)
+	response, err = authedCall(t, runtime, missingConfirmRestore)
 	if err != nil || response.StatusCode != http.StatusBadRequest || !strings.Contains(string(response.Body), "missing X-Confirm-Restore: replace header") {
 		t.Fatalf("missing confirm restore response: %+v, %v", response, err)
 	}
@@ -666,7 +528,7 @@ func TestManagementBackupAndRestore(t *testing.T) {
 		},
 		Body: []byte("not-a-database"),
 	})
-	response, err = runtime.handleManagement(invalidBodyRestore)
+	response, err = authedCall(t, runtime, invalidBodyRestore)
 	if err != nil || response.StatusCode != http.StatusBadRequest {
 		t.Fatalf("invalid body restore response: %+v, %v", response, err)
 	}
@@ -690,16 +552,11 @@ func TestManagementBackupAndRestore(t *testing.T) {
 	if err := store.Reset(); err != nil {
 		t.Fatal(err)
 	}
-	// Mutate preferences/prices after backup so restore must reintroduce the originals.
-	// Reset only clears usage counters, not preferences or prices.
+	// Mutate preferences after backup so restore must reintroduce the originals.
+	// Reset only clears usage counters, not preferences.
 	if _, err := store.SaveDashboardPreferences(DashboardPreferences{
 		RequestPageSize:   100,
 		DimensionPageSize: 100,
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := store.SaveModelPrices(map[string]ModelPrice{
-		"mutated-model": {Input: 9, Output: 9},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -720,7 +577,7 @@ func TestManagementBackupAndRestore(t *testing.T) {
 		},
 		Body: backupBody,
 	})
-	response, err = runtime.handleManagement(roundTripRestore)
+	response, err = authedCall(t, runtime, roundTripRestore)
 	if err != nil || response.StatusCode != http.StatusOK || !strings.Contains(string(response.Body), `"restored":true`) {
 		t.Fatalf("round-trip restore response: %+v, %v", response, err)
 	}
@@ -738,13 +595,6 @@ func TestManagementBackupAndRestore(t *testing.T) {
 	if preferences.RequestPageSize != 25 || preferences.DimensionPageSize != 50 {
 		t.Fatalf("restored preferences = %+v, want request=25 dimension=50", preferences)
 	}
-	prices, err := store.QueryModelPrices()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(prices) != 1 || prices["backup-endpoint"].Input != 1.5 || prices["backup-endpoint"].Output != 6 {
-		t.Fatalf("restored model prices = %+v", prices)
-	}
 }
 
 func TestAPIKeyIdentitiesFromRequestUnionsRepeatedRefs(t *testing.T) {
@@ -753,7 +603,7 @@ func TestAPIKeyIdentitiesFromRequestUnionsRepeatedRefs(t *testing.T) {
 	refA := apiKeyRef(1, hashA)
 	refB := apiKeyRef(2, hashB)
 	request := pluginapi.ManagementRequest{Query: url.Values{"api_key_ref": {refA, "", refB, refA}}}
-	got, err := apiKeyIdentitiesFromRequest(request, true, nil)
+	got, err := apiKeyIdentitiesFromRequest(request, nil)
 	if err != nil {
 		t.Fatalf("parse repeated refs: %v", err)
 	}
@@ -762,19 +612,22 @@ func TestAPIKeyIdentitiesFromRequestUnionsRepeatedRefs(t *testing.T) {
 	}
 }
 
-func TestAPIKeyIdentitiesFromRequestRequiresFullModeForRepeatedRefs(t *testing.T) {
+func TestAPIKeyIdentitiesFromRequestUnionsRepeatedRefsWithoutPlaintext(t *testing.T) {
 	refA := apiKeyRef(1, strings.Repeat("a", 32))
 	refB := apiKeyRef(1, strings.Repeat("b", 32))
-	_, err := apiKeyIdentitiesFromRequest(pluginapi.ManagementRequest{Query: url.Values{"api_key_ref": {refA, refB}}}, false, nil)
-	if err == nil || errorHTTPStatus(err) != http.StatusForbidden || err.Error() != "API key filtering requires a full-mode session" {
-		t.Fatalf("missing full-mode error = %v", err)
+	got, err := apiKeyIdentitiesFromRequest(pluginapi.ManagementRequest{Query: url.Values{"api_key_ref": {refA, refB}}}, nil)
+	if err != nil {
+		t.Fatalf("repeated refs should not require key material: %v", err)
+	}
+	if len(got) != 2 || got[0] != refA || got[1] != refB {
+		t.Fatalf("identities = %#v, want [%q %q]", got, refA, refB)
 	}
 }
 
 func TestAPIKeyIdentitiesFromRequestRejectsRefAndHashTogether(t *testing.T) {
 	refA := apiKeyRef(1, strings.Repeat("a", 32))
 	hashB := strings.Repeat("b", 32)
-	_, err := apiKeyIdentitiesFromRequest(pluginapi.ManagementRequest{Query: url.Values{"api_key_ref": {refA}, "api_key_hash": {hashB}}}, true, nil)
+	_, err := apiKeyIdentitiesFromRequest(pluginapi.ManagementRequest{Query: url.Values{"api_key_ref": {refA}, "api_key_hash": {hashB}}}, nil)
 	if err == nil || errorHTTPStatus(err) != http.StatusBadRequest || err.Error() != "api_key_ref and api_key_hash cannot be used together" {
 		t.Fatalf("mixed filter error = %v", err)
 	}
@@ -783,7 +636,7 @@ func TestAPIKeyIdentitiesFromRequestRejectsRefAndHashTogether(t *testing.T) {
 func TestAPIKeyIdentitiesFromRequestRejectsRepeatedHashes(t *testing.T) {
 	hashA := strings.Repeat("a", 32)
 	hashB := strings.Repeat("b", 32)
-	_, err := apiKeyIdentitiesFromRequest(pluginapi.ManagementRequest{Query: url.Values{"api_key_hash": {hashA, hashB}}}, true, nil)
+	_, err := apiKeyIdentitiesFromRequest(pluginapi.ManagementRequest{Query: url.Values{"api_key_hash": {hashA, hashB}}}, nil)
 	if err == nil || errorHTTPStatus(err) != http.StatusBadRequest || err.Error() != "api_key_hash cannot be repeated; use api_key_ref" {
 		t.Fatalf("repeated hash error = %v", err)
 	}
@@ -814,7 +667,7 @@ func TestDashboardPreferencesManagementSaveRoute(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		response, err := runtime.handleManagement(raw)
+		response, err := authedCall(t, runtime, raw)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -870,5 +723,250 @@ func TestDashboardPreferencesManagementSaveRoute(t *testing.T) {
 	saved = DashboardPreferences{}
 	if err := json.Unmarshal(response.Body, &saved); err != nil || saved.RequestPageSize != 75 || saved.DimensionPageSize != 100 || saved.TokenDisplayMode != "m" {
 		t.Fatalf("legacy stored preferences payload = %s, err = %v", response.Body, err)
+	}
+}
+
+func TestManagementMultiModelFilterScopesDashboardRoutes(t *testing.T) {
+	config := testConfig(t)
+	store, err := openStore(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime := &pluginRuntime{store: store, config: config, routes: registeredRoutes{
+		pluginID:                 "test",
+		resourceStatsInitialPath: "/v0/resource/plugins/test/stats/initial",
+		resourceStatsGroupsPath:  "/v0/resource/plugins/test/stats/groups",
+		resourceRequestsPath:     "/v0/resource/plugins/test/requests",
+	}}
+	defer runtime.shutdown()
+	for model, tokens := range map[string]uint64{"alpha": 3, "beta": 5, "gamma": 7} {
+		if err := store.Record(normalizedUsage{
+			Dimensions:  Dimensions{Model: model, Source: "cli"},
+			RequestedAt: nowUTC(),
+			Counters:    Counters{Requests: 1, TotalTokens: tokens},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	call := func(path string, query url.Values) pluginapi.ManagementResponse {
+		t.Helper()
+		raw, _ := json.Marshal(pluginapi.ManagementRequest{Method: http.MethodGet, Path: path, Query: query})
+		response, callErr := authedCall(t, runtime, raw)
+		if callErr != nil || response.StatusCode != http.StatusOK {
+			t.Fatalf("%s response = %+v, %v", path, response, callErr)
+		}
+		return response
+	}
+
+	initial := call(runtime.routes.resourceStatsInitialPath, url.Values{"range": {"24h"}, "model": {"alpha", "beta", "alpha"}})
+	var stats InitialStatsResponse
+	if err := json.Unmarshal(initial.Body, &stats); err != nil {
+		t.Fatal(err)
+	}
+	if stats.Summary.Requests != 2 || stats.Summary.TotalTokens != 8 {
+		t.Fatalf("multi-model summary = %+v", stats.Summary)
+	}
+	if len(stats.Models) != 2 {
+		t.Fatalf("multi-model rows = %+v", stats.Models)
+	}
+	for _, row := range stats.Models {
+		if row.Model != "alpha" && row.Model != "beta" {
+			t.Fatalf("unexpected model row %+v", row)
+		}
+	}
+
+	groups := call(runtime.routes.resourceStatsGroupsPath, url.Values{"range": {"24h"}, "model": {"gamma"}, "offset": {"0"}, "limit": {"50"}})
+	var page GroupStatsPage
+	if err := json.Unmarshal(groups.Body, &page); err != nil {
+		t.Fatal(err)
+	}
+	if page.Total != 1 || page.Items[0].Model != "gamma" {
+		t.Fatalf("group model filter = %+v", page)
+	}
+
+	requests := call(runtime.routes.resourceRequestsPath, url.Values{"range": {"24h"}, "model": {"alpha", "gamma"}, "offset": {"0"}, "limit": {"50"}})
+	var requestPage RequestPage
+	if err := json.Unmarshal(requests.Body, &requestPage); err != nil {
+		t.Fatal(err)
+	}
+	if requestPage.Total != 2 {
+		t.Fatalf("request model filter total = %d", requestPage.Total)
+	}
+	for _, item := range requestPage.Items {
+		if item.Model == "beta" {
+			t.Fatalf("request model filter leaked beta: %+v", item)
+		}
+	}
+}
+
+func TestManagementInitialStatsExposeAPIKeyFilterOptions(t *testing.T) {
+	config := testConfig(t)
+	config.APIKeySecret = defaultAPIKeySecret
+	config.SyncOnRecord = true
+	crypto, err := deriveCryptoContext(config.APIKeySecret)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := openStoreWithCrypto(config, crypto)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime := &pluginRuntime{
+		store:  store,
+		config: config,
+		crypto: crypto,
+		routes: registeredRoutes{
+			pluginID:                 "test",
+			resourceStatsInitialPath: "/v0/resource/plugins/test/stats/initial",
+		},
+	}
+	defer runtime.shutdown()
+	keyA := "test-client-key-alpha"
+	keyB := "test-client-key-beta"
+	for index, key := range []string{keyA, keyA, keyB} {
+		record := pluginapi.UsageRecord{
+			Provider:    "test",
+			Model:       "model-alpha",
+			Source:      "cli",
+			APIKey:      key,
+			RequestedAt: time.Now().UTC().Add(time.Duration(index-3) * time.Second),
+			Detail:      pluginapi.UsageDetail{InputTokens: int64(index + 1), OutputTokens: 1, TotalTokens: int64(index + 2)},
+		}
+		raw, marshalErr := json.Marshal(record)
+		if marshalErr != nil {
+			t.Fatal(marshalErr)
+		}
+		if _, err := runtime.handleUsage(raw); err != nil {
+			t.Fatal(err)
+		}
+	}
+	hashA := apiKeyFingerprint(keyA, crypto.indexKey)
+	refA := apiKeyRef(1, hashA)
+	if err := store.SetAPIKeyLabel(refA, "cup"); err != nil {
+		t.Fatal(err)
+	}
+	call := func(query url.Values) InitialStatsResponse {
+		t.Helper()
+		raw, _ := json.Marshal(pluginapi.ManagementRequest{Method: http.MethodGet, Path: runtime.routes.resourceStatsInitialPath, Query: query})
+		response, callErr := authedCall(t, runtime, raw)
+		if callErr != nil || response.StatusCode != http.StatusOK {
+			t.Fatalf("initial stats = %+v, %v", response, callErr)
+		}
+		if strings.Contains(string(response.Body), `"key":`) || strings.Contains(string(response.Body), `"api_key_hash"`) {
+			t.Fatalf("ordinary response leaked key material: %s", response.Body)
+		}
+		var stats InitialStatsResponse
+		if err := json.Unmarshal(response.Body, &stats); err != nil {
+			t.Fatal(err)
+		}
+		return stats
+	}
+
+	stats := call(url.Values{"range": {"24h"}})
+	if len(stats.APIKeys) != 2 {
+		t.Fatalf("api key options = %+v", stats.APIKeys)
+	}
+	byRef := map[string]APIKeyOption{}
+	for _, option := range stats.APIKeys {
+		byRef[option.Ref] = option
+	}
+	optionA, ok := byRef[refA]
+	if !ok {
+		t.Fatalf("missing ref for key A: %+v", stats.APIKeys)
+	}
+	if optionA.Label != "cup" || optionA.Requests != 2 || optionA.TotalTokens == 0 {
+		t.Fatalf("labeled option = %+v", optionA)
+	}
+	if optionA.Key != "" || optionA.Hash != "" || optionA.Generation != 0 {
+		t.Fatalf("ordinary response leaked key identity: %+v", optionA)
+	}
+
+	// Filtering by the fingerprint works with any dashboard session.
+	filtered := call(url.Values{"range": {"24h"}, "api_key_ref": {refA}})
+	if filtered.Summary.Requests != 2 {
+		t.Fatalf("filtered summary = %+v", filtered.Summary)
+	}
+	if len(filtered.APIKeys) != 2 {
+		t.Fatalf("filtered options should still list every key: %+v", filtered.APIKeys)
+	}
+	for _, option := range filtered.APIKeys {
+		if option.Ref != refA && option.TotalTokens != 0 {
+			t.Fatalf("unselected key should report zero counters: %+v", option)
+		}
+	}
+}
+
+func TestInitialStatsScaleAndRequestedScale(t *testing.T) {
+	config := testConfig(t)
+	store, err := openStore(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime := &pluginRuntime{store: store, config: config, routes: registeredRoutes{
+		pluginID:                 "test",
+		resourceStatsInitialPath: "/v0/resource/plugins/test/stats/initial",
+	}}
+	defer runtime.shutdown()
+
+	if err := store.Record(normalizedUsage{
+		Dimensions:  Dimensions{Model: "gpt-test", Source: "cli"},
+		RequestedAt: nowUTC(),
+		Counters:    Counters{Requests: 1, TotalTokens: 10},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	call := func(query url.Values) (InitialStatsResponse, int, string) {
+		t.Helper()
+		raw, _ := json.Marshal(pluginapi.ManagementRequest{Method: http.MethodGet, Path: runtime.routes.resourceStatsInitialPath, Query: query})
+		response, callErr := authedCall(t, runtime, raw)
+		if callErr != nil {
+			t.Fatalf("call error: %v", callErr)
+		}
+		var stats InitialStatsResponse
+		_ = json.Unmarshal(response.Body, &stats)
+		return stats, response.StatusCode, string(response.Body)
+	}
+
+	// 1. 30d with scale=minute -> clamped to hour, requested_scale="minute"
+	stats, code, body := call(url.Values{"range": {"30d"}, "scale": {"minute"}})
+	if code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", code)
+	}
+	if stats.Scale != "hour" || stats.RequestedScale != "minute" {
+		t.Fatalf("expected hour / minute, got scale=%q requested_scale=%q", stats.Scale, stats.RequestedScale)
+	}
+	if !strings.Contains(body, `"requested_scale":"minute"`) {
+		t.Fatalf("body missing requested_scale JSON: %s", body)
+	}
+
+	// 2. 30d with scale=hour -> fits cap 1440, scale="hour", requested_scale omitted
+	stats, code, body = call(url.Values{"range": {"30d"}, "scale": {"hour"}})
+	if code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", code)
+	}
+	if stats.Scale != "hour" || stats.RequestedScale != "" {
+		t.Fatalf("expected hour / empty, got scale=%q requested_scale=%q", stats.Scale, stats.RequestedScale)
+	}
+	if strings.Contains(body, `"requested_scale"`) {
+		t.Fatalf("body should omit requested_scale when not clamped: %s", body)
+	}
+
+	// 3. 24h with scale=minute -> fits cap 1440, scale="minute", requested_scale omitted
+	stats, code, body = call(url.Values{"range": {"24h"}, "scale": {"minute"}})
+	if code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", code)
+	}
+	if stats.Scale != "minute" || stats.RequestedScale != "" {
+		t.Fatalf("expected minute / empty, got scale=%q requested_scale=%q", stats.Scale, stats.RequestedScale)
+	}
+	if strings.Contains(body, `"requested_scale"`) {
+		t.Fatalf("body should omit requested_scale when not clamped: %s", body)
+	}
+
+	// 4. Invalid scale returns 400
+	_, code, _ = call(url.Values{"range": {"30d"}, "scale": {"invalid"}})
+	if code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for invalid scale, got %d", code)
 	}
 }

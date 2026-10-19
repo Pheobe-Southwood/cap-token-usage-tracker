@@ -215,9 +215,19 @@ func TestCompactStatsDownsamplesAndPreservesCounters(t *testing.T) {
 		{Hour: now.Add(-2*time.Minute - 30*time.Second).Unix(), Dimensions: model}: {Requests: 3, TotalTokens: 30, TotalLatencyNS: uint64(9 * time.Second), LatencySamples: 3, TotalTTFTNS: uint64(2 * time.Second), TTFTSamples: 2},
 	}
 	queryRange := usageRange{Name: "24h", Start: now.Add(-24 * time.Hour)}
-	initial := buildInitialStatsForRange(data, now.Add(-30*24*time.Hour), now, queryRange, usageFilter{}, now, nil)
-	if initial.SchemaVersion != 2 || initial.BucketSeconds != 300 || len(initial.Series) != 1 || len(initial.Models) != 1 {
+	initial := buildInitialStatsForRange(data, now.Add(-30*24*time.Hour), now, queryRange, usageFilter{}, now, nil, nil, seriesSpec{})
+	// A 24h window resolves to the hour scale and is zero-filled end to end.
+	if initial.SchemaVersion != 3 || initial.Scale != seriesScaleHour || initial.BucketSeconds != 3600 || len(initial.Series) != 24 || len(initial.CostSeries) != 24 || len(initial.Models) != 1 {
 		t.Fatalf("compact initial shape = %+v", initial)
+	}
+	filled := 0
+	for _, point := range initial.Series {
+		if point.Requests > 0 {
+			filled++
+		}
+	}
+	if filled != 1 {
+		t.Fatalf("expected exactly one populated hour bucket, got %d", filled)
 	}
 	if initial.Summary.Requests != 5 || initial.Summary.TotalTokens != 50 || initial.Models[0].AverageLatencyNS != uint64(2600*time.Millisecond) || initial.Models[0].AverageTTFTNS != uint64(time.Second) {
 		t.Fatalf("compact initial counters = %+v", initial)
@@ -233,7 +243,7 @@ func TestCompactStatsDownsamplesAndPreservesCounters(t *testing.T) {
 }
 
 func TestInitialStatsJSONExcludesDetails(t *testing.T) {
-	response := InitialStatsResponse{SchemaVersion: 2, Models: []ModelStats{{Model: "m"}}, Series: []SeriesPoint{}}
+	response := InitialStatsResponse{SchemaVersion: 3, Models: []ModelStats{{Model: "m"}}, Series: []SeriesPoint{}}
 	body, err := json.Marshal(response)
 	if err != nil {
 		t.Fatal(err)
@@ -297,7 +307,7 @@ func TestUntitledModelAggregatesStayBackendNeutral(t *testing.T) {
 	if len(stats.ModelSeries) != 2 || stats.ModelSeries[0].Model != "" || stats.ModelSeries[1].Model != "named" {
 		t.Fatalf("model series = %+v", stats.ModelSeries)
 	}
-	initial := buildInitialStatsForRange(data, now.Add(-time.Hour), now, queryRange, usageFilter{}, now, nil)
+	initial := buildInitialStatsForRange(data, now.Add(-time.Hour), now, queryRange, usageFilter{}, now, nil, nil, seriesSpec{})
 	if len(initial.Models) != 2 || initial.Models[0].Model != "" || initial.Models[1].Model != "named" {
 		t.Fatalf("initial models = %+v", initial.Models)
 	}

@@ -197,7 +197,6 @@ func TestReconfigureCryptoIdentityRollsBackWithFailedCandidateFlush(t *testing.T
 		config:               config,
 		data:                 make(map[aggregateKey]Counters),
 		dirty:                make(map[aggregateKey]struct{}),
-		modelPrices:          make(map[string]ModelPrice),
 		dashboardPreferences: defaultDashboardPreferences(),
 		apiKeyCiphertexts:    make(map[string]string),
 		apiKeyLabels:         make(map[string]string),

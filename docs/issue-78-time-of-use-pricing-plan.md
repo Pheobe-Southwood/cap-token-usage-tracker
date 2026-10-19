@@ -2,6 +2,21 @@
 
 对应 https://github.com/AITNR/cap-token-usage-tracker/issues/78 。
 
+## 当前状态（v2.6.0）
+
+v2.6.0 重新落地了时段价，实现与本文档最初的设计稿有少量差异，以代码与
+[model-pricing.md](model-pricing.md) 的「时段价（峰谷）」一节为准：
+
+- 字段名是 `cache_write`（与 `ModelPrice` 其余字段一致），不是 `cache_creation`。
+- 时段价存放在手工价格条目内的 `time_zone` + `time_tiers`（`PUT /v0/management/plugins/<id>/model-prices`），
+  没有独立的 `prices` 账本结构，也没有 Service Tier / Context Tier 层；因此本文「价格优先级」一节中
+  与 Context Tier 相关的部分**未实现**（目录分档价仍被忽略）。
+- 新增内置峰谷计划（`peak_pricing`，默认开），让 DeepSeek 花销与兄弟插件 `cap-opencode-go` 对齐；
+  手工时段价优先于内置计划。
+- 保存不再新增 revision 字段：费用本来就不落库，历史区间按当前价目表现算。
+- 其余设计（32 个时段上限、HH:mm、左闭右开、跨午夜归属起始日、禁止 Local、内嵌 tzdata、夏令时语义、
+  旧配置兼容、降级风险）与本文档一致，并已由 Go 单测与浏览器回归覆盖。
+
 ## 实现范围
 
 完整模式的模型价格编辑器新增峰谷定价折叠区。模型可配置 IANA 时区、时段名称、ISO 星期编号（1=星期一，7=星期日，留空为每天）、开始和结束时间，以及四项 USD/百万 token 单价。

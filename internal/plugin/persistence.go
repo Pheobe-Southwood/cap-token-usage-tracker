@@ -37,6 +37,7 @@ var (
 	apiKeyLabelsKey         = []byte("api_key_labels")
 	apiKeyCatalogKey        = []byte("api_key_catalog")
 	observedModelsKey       = []byte("observed_models")
+	modelPriceOverridesKey  = []byte("model_price_overrides")
 )
 
 const persistenceSchemaVersion uint64 = 10
@@ -64,13 +65,18 @@ const (
 	statsQueryInitial
 	statsQueryTrend
 	statsQueryGroups
+	statsQueryModels
 )
 
 type queryCommand struct {
-	queryRange usageRange
-	filter     usageFilter
-	mode       statsQueryMode
-	resp       chan queryResult
+	queryRange      usageRange
+	filter          usageFilter
+	mode            statsQueryMode
+	pricer          modelPricing
+	scale           string
+	tzOffsetMinutes int
+	linkage         *ttftLinkage
+	resp            chan queryResult
 }
 
 type queryResult struct {
@@ -78,6 +84,7 @@ type queryResult struct {
 	initial InitialStatsResponse
 	trend   StatsTrendResponse
 	groups  GroupStatsPage
+	models  ModelsResponse
 	err     error
 }
 
@@ -96,23 +103,6 @@ type requestQueryResult struct {
 	err  error
 }
 
-type priceQueryCommand struct{ resp chan priceQueryResult }
-type priceQueryResult struct {
-	response ModelPricesResponse
-	err      error
-}
-type savePricesCommand struct {
-	prices   map[string]ModelPrice
-	settings *PriceSyncSettings
-	resp     chan priceQueryResult
-}
-type syncPricesCommand struct {
-	prices           map[string]ModelPrice
-	settings         PriceSyncSettings
-	metadata         PriceSyncMetadata
-	expectedRevision uint64
-	resp             chan priceQueryResult
-}
 type observedModelsCommand struct {
 	now  time.Time
 	resp chan observedModelsResult
@@ -120,15 +110,6 @@ type observedModelsCommand struct {
 type observedModelsResult struct {
 	models []string
 	err    error
-}
-type costSnapshotCommand struct {
-	queryRange usageRange
-	filter     usageFilter
-	resp       chan costSnapshotResult
-}
-type costSnapshotResult struct {
-	snapshot costQuerySnapshot
-	err      error
 }
 type preferencesQueryCommand struct{ resp chan preferencesResult }
 type savePreferencesCommand struct {
@@ -149,6 +130,16 @@ type labelSetCommand struct {
 	hash  string
 	label string
 	resp  chan error
+}
+type modelPriceQueryCommand struct{ resp chan modelPriceResult }
+type modelPriceSetCommand struct {
+	model string
+	price *ModelPrice
+	resp  chan modelPriceResult
+}
+type modelPriceResult struct {
+	overrides map[string]ModelPrice
+	err       error
 }
 type apiKeyResolveCommand struct {
 	hash string
@@ -218,11 +209,6 @@ type Store struct {
 	done             chan struct{}
 	closeOnce        sync.Once
 	stateMu          sync.RWMutex
-	costMu           sync.Mutex
-	costCache        map[costCacheKey]CostResponse
-	costOrder        []costCacheKey
-	costFlights      map[costCacheKey]*costFlight
-	costScanHook     func()
 	closed           bool
 	closeErr         error
 	cryptoMu         sync.RWMutex
@@ -243,14 +229,10 @@ type storeActor struct {
 	lastFlushErr         error
 	pendingRequests      []RequestDetail
 	nextRequestSeq       uint64
-	modelPrices          map[string]ModelPrice
-	priceRevision        uint64
-	priceSyncSettings    PriceSyncSettings
-	lastPriceSync        *PriceSyncMetadata
-	costGeneration       uint64
 	dashboardPreferences DashboardPreferences
 	apiKeyCiphertexts    map[string]string
 	apiKeyLabels         map[string]string
+	modelPriceOverrides  map[string]ModelPrice
 	apiKeyCatalog        map[string]apiKeyCatalogEntry
 	persistedAggregates  map[aggregateKey]struct{}
 	observedModelCounts  map[string]uint64
@@ -390,8 +372,6 @@ func openStoreWithCrypto(config Config, crypto cryptoContext) (*Store, error) {
 		lease:            lease,
 		commands:         make(chan any, 256),
 		done:             make(chan struct{}),
-		costCache:        make(map[costCacheKey]CostResponse),
-		costFlights:      make(map[costCacheKey]*costFlight),
 		activeGeneration: actor.activeGeneration,
 		generations:      cloneAPIKeyGenerations(actor.generations),
 	}
@@ -433,9 +413,21 @@ func (s *Store) queryStatsByFilter(queryRange usageRange, filter usageFilter) (S
 	return result.stats, result.err
 }
 
-func (s *Store) queryInitialStatsByFilter(queryRange usageRange, filter usageFilter) (InitialStatsResponse, error) {
+// initialQueryOptions carries the resolved dashboard axis request into the
+// store actor. The zero value keeps the legacy behaviour (automatic scale).
+type initialQueryOptions struct {
+	scale           string
+	tzOffsetMinutes int
+	linkage         *ttftLinkage
+}
+
+func (s *Store) queryInitialStatsByFilter(queryRange usageRange, filter usageFilter, pricer modelPricing, options initialQueryOptions) (InitialStatsResponse, error) {
 	resp := make(chan queryResult, 1)
-	if err := s.send(queryCommand{queryRange: queryRange, filter: filter, mode: statsQueryInitial, resp: resp}); err != nil {
+	command := queryCommand{queryRange: queryRange, filter: filter, mode: statsQueryInitial, pricer: pricer, resp: resp}
+	command.scale = options.scale
+	command.tzOffsetMinutes = options.tzOffsetMinutes
+	command.linkage = options.linkage
+	if err := s.send(command); err != nil {
 		return InitialStatsResponse{}, err
 	}
 	result := <-resp
@@ -449,6 +441,15 @@ func (s *Store) queryStatsTrendByFilter(queryRange usageRange, filter usageFilte
 	}
 	result := <-resp
 	return result.trend, result.err
+}
+
+func (s *Store) queryModelsByFilter(queryRange usageRange, filter usageFilter, pricer modelPricing, linkage *ttftLinkage) (ModelsResponse, error) {
+	resp := make(chan queryResult, 1)
+	if err := s.send(queryCommand{queryRange: queryRange, filter: filter, mode: statsQueryModels, pricer: pricer, linkage: linkage, resp: resp}); err != nil {
+		return ModelsResponse{}, err
+	}
+	result := <-resp
+	return result.models, result.err
 }
 
 func (s *Store) queryGroupsByFilter(queryRange usageRange, filter usageFilter) (GroupStatsPage, error) {
@@ -544,62 +545,6 @@ func (s *Store) SaveDashboardPreferences(preferences DashboardPreferences) (Dash
 	return result.preferences, result.err
 }
 
-func (s *Store) QueryModelPrices() (map[string]ModelPrice, error) {
-	response, err := s.QueryPriceBook()
-	return response.Prices, err
-}
-
-func (s *Store) QueryPriceBook() (ModelPricesResponse, error) {
-	resp := make(chan priceQueryResult, 1)
-	if err := s.send(priceQueryCommand{resp: resp}); err != nil {
-		return ModelPricesResponse{}, err
-	}
-	result := <-resp
-	return result.response, result.err
-}
-
-func (s *Store) SaveModelPrices(prices map[string]ModelPrice) (map[string]ModelPrice, error) {
-	response, err := s.SavePriceBook(prices, nil)
-	return response.Prices, err
-}
-
-func (s *Store) SavePriceBook(prices map[string]ModelPrice, settings *PriceSyncSettings) (ModelPricesResponse, error) {
-	normalized, err := normalizeModelPrices(cloneModelPrices(prices))
-	if err != nil {
-		return ModelPricesResponse{}, withStatus(400, "%v", err)
-	}
-	if settings != nil {
-		normalizedSettings, err := normalizePriceSyncSettings(*settings)
-		if err != nil {
-			return ModelPricesResponse{}, withStatus(400, "%v", err)
-		}
-		settings = &normalizedSettings
-	}
-	resp := make(chan priceQueryResult, 1)
-	if err := s.send(savePricesCommand{prices: normalized, settings: settings, resp: resp}); err != nil {
-		return ModelPricesResponse{}, err
-	}
-	result := <-resp
-	return result.response, result.err
-}
-
-func (s *Store) ApplyModelPriceSync(prices map[string]ModelPrice, settings PriceSyncSettings, metadata PriceSyncMetadata, expectedRevision uint64) (ModelPricesResponse, error) {
-	normalized, err := normalizeModelPrices(prices)
-	if err != nil {
-		return ModelPricesResponse{}, withStatus(400, "%v", err)
-	}
-	normalizedSettings, err := normalizePriceSyncSettings(settings)
-	if err != nil {
-		return ModelPricesResponse{}, withStatus(400, "%v", err)
-	}
-	resp := make(chan priceQueryResult, 1)
-	if err := s.send(syncPricesCommand{prices: normalized, settings: normalizedSettings, metadata: metadata, expectedRevision: expectedRevision, resp: resp}); err != nil {
-		return ModelPricesResponse{}, err
-	}
-	result := <-resp
-	return result.response, result.err
-}
-
 func (s *Store) ObservedModels() ([]string, error) {
 	resp := make(chan observedModelsResult, 1)
 	if err := s.send(observedModelsCommand{now: time.Now().UTC(), resp: resp}); err != nil {
@@ -607,6 +552,27 @@ func (s *Store) ObservedModels() ([]string, error) {
 	}
 	result := <-resp
 	return result.models, result.err
+}
+
+// ModelPriceOverrides returns the stored manual price overrides.
+func (s *Store) ModelPriceOverrides() (map[string]ModelPrice, error) {
+	resp := make(chan modelPriceResult, 1)
+	if err := s.send(modelPriceQueryCommand{resp: resp}); err != nil {
+		return nil, err
+	}
+	result := <-resp
+	return result.overrides, result.err
+}
+
+// SetModelPriceOverride stores or clears one manual price and returns the
+// resulting override table.
+func (s *Store) SetModelPriceOverride(model string, price *ModelPrice) (map[string]ModelPrice, error) {
+	resp := make(chan modelPriceResult, 1)
+	if err := s.send(modelPriceSetCommand{model: model, price: price, resp: resp}); err != nil {
+		return nil, err
+	}
+	result := <-resp
+	return result.overrides, result.err
 }
 
 func (s *Store) Reset() error {
@@ -710,11 +676,6 @@ func (s *Store) RestoreBackup(backup []byte) error {
 		s.activeGeneration = result.generation
 		s.generations = cloneAPIKeyGenerations(result.generations)
 		s.cryptoMu.Unlock()
-		s.costMu.Lock()
-		s.costCache = make(map[costCacheKey]CostResponse)
-		s.costOrder = nil
-		s.costFlights = make(map[costCacheKey]*costFlight)
-		s.costMu.Unlock()
 	}
 	return result.err
 }
@@ -744,26 +705,34 @@ func (s *Store) run(actor *storeActor) {
 				item.resp <- actor.record(item.usage)
 			case queryCommand:
 				now := time.Now().UTC()
-				if requiresExactStats(item.queryRange) {
+				spec := resolveSeriesSpec(item.scale, item.tzOffsetMinutes, item.queryRange, actor.since, now)
+				// Sub-hour dashboards cannot be served from the hourly aggregate
+				// bucket, so they are rebuilt from the persisted request rows the
+				// same way second-precision custom ranges already are.
+				if requiresExactStats(item.queryRange) || (item.mode == statsQueryInitial && spec.BucketSeconds < seriesHourSeconds) {
 					if err := actor.flush(now, true); err != nil {
 						actor.lastFlushErr = err
 						item.resp <- queryResult{err: err}
 						continue
 					}
-					stats, err := actor.queryExactStats(item.queryRange, item.filter, now)
+					data, err := actor.loadRequestAggregates(item.queryRange, now)
 					if err != nil {
 						item.resp <- queryResult{err: err}
 						continue
 					}
+					// The request scan already applied the exact bounds, so the
+					// builders must not re-filter minute-aligned buckets against
+					// second-precision edges. The fill window travels in spec.
+					nameOnly := usageRange{Name: item.queryRange.Name}
 					switch item.mode {
 					case statsQueryInitial:
-						item.resp <- queryResult{initial: initialStatsFromFull(stats, item.queryRange)}
+						item.resp <- queryResult{initial: buildInitialStatsForRange(data, actor.since, actor.lastUsed, nameOnly, item.filter, now, actor.apiKeyCiphertexts, item.pricer, spec)}
 					case statsQueryTrend:
-						item.resp <- queryResult{trend: trendStatsFromFull(stats, item.queryRange)}
+						item.resp <- queryResult{trend: buildStatsTrendForRange(data, actor.since, nameOnly, item.filter, now)}
 					case statsQueryGroups:
-						item.resp <- queryResult{groups: GroupStatsPage{SchemaVersion: 2, GeneratedAt: stats.GeneratedAt, Range: stats.Range, Items: stats.Groups, Total: len(stats.Groups)}}
+						item.resp <- queryResult{groups: buildGroupsForRange(data, nameOnly, item.filter, now, actor.apiKeyCiphertexts)}
 					default:
-						item.resp <- queryResult{stats: stats}
+						item.resp <- queryResult{stats: buildStatsForRangeWithFilter(data, actor.since, actor.lastUsed, nameOnly, item.filter, now, actor.apiKeyCiphertexts)}
 					}
 					continue
 				}
@@ -782,7 +751,14 @@ func (s *Store) run(actor *storeActor) {
 				}
 				switch item.mode {
 				case statsQueryInitial:
-					item.resp <- queryResult{initial: buildInitialStatsForRange(data, actor.since, actor.lastUsed, item.queryRange, item.filter, now, actor.apiKeyCiphertexts)}
+					item.resp <- queryResult{initial: buildInitialStatsForRange(data, actor.since, actor.lastUsed, item.queryRange, item.filter, now, actor.apiKeyCiphertexts, item.pricer, spec)}
+				case statsQueryModels:
+					observed, err := actor.observedModels(now)
+					if err != nil {
+						item.resp <- queryResult{err: err}
+						continue
+					}
+					item.resp <- queryResult{models: buildModelsForRange(data, actor.since, actor.lastUsed, item.queryRange, item.filter, now, item.pricer, observed, cloneModelPriceOverrides(actor.modelPriceOverrides), item.linkage)}
 				case statsQueryTrend:
 					item.resp <- queryResult{trend: buildStatsTrendForRange(data, actor.since, item.queryRange, item.filter, now)}
 				case statsQueryGroups:
@@ -813,17 +789,13 @@ func (s *Store) run(actor *storeActor) {
 				item.resp <- labelQueryResult{labels: cloneStringMap(actor.apiKeyLabels)}
 			case labelSetCommand:
 				item.resp <- actor.setAPIKeyLabel(item.hash, item.label)
+			case modelPriceQueryCommand:
+				item.resp <- modelPriceResult{overrides: cloneModelPriceOverrides(actor.modelPriceOverrides)}
+			case modelPriceSetCommand:
+				item.resp <- actor.setModelPriceOverride(item.model, item.price)
 			case apiKeyResolveCommand:
 				ref, err := actor.resolveAPIKeyHash(item.hash)
 				item.resp <- apiKeyResolveResult{ref: ref, err: err}
-			case priceQueryCommand:
-				item.resp <- priceQueryResult{response: actor.priceBookResponse()}
-			case savePricesCommand:
-				response, err := actor.saveModelPrices(item.prices, item.settings)
-				item.resp <- priceQueryResult{response: response, err: err}
-			case syncPricesCommand:
-				response, err := actor.applyModelPriceSync(item.prices, item.settings, item.metadata, item.expectedRevision)
-				item.resp <- priceQueryResult{response: response, err: err}
 			case observedModelsCommand:
 				if err := actor.flush(item.now, true); err != nil {
 					actor.lastFlushErr = err
@@ -832,26 +804,6 @@ func (s *Store) run(actor *storeActor) {
 				}
 				models, err := actor.observedModels(item.now)
 				item.resp <- observedModelsResult{models: models, err: err}
-			case costSnapshotCommand:
-				now := time.Now().UTC()
-				if err := actor.flush(now, true); err != nil {
-					actor.lastFlushErr = err
-					item.resp <- costSnapshotResult{err: err}
-					continue
-				}
-				err := item.queryRange.validate()
-				item.resp <- costSnapshotResult{snapshot: costQuerySnapshot{
-					Range:         item.queryRange.Name,
-					Start:         item.queryRange.Start,
-					End:           item.queryRange.End,
-					GeneratedAt:   now,
-					Prices:        cloneModelPrices(actor.modelPrices),
-					PriceSettings: clonePriceSyncSettings(actor.priceSyncSettings),
-					PriceRevision: actor.priceRevision,
-					HighWater:     actor.nextRequestSeq,
-					Generation:    actor.costGeneration,
-					Filter:        item.filter,
-				}, err: err}
 			case resetCommand:
 				if err := actor.retryFailedFlush(time.Now().UTC()); err != nil {
 					item.resp <- resetResult{err: err}
@@ -1035,13 +987,10 @@ func (a *storeActor) reload() error {
 	a.since = time.Time{}
 	a.lastUsed = time.Time{}
 	a.nextRequestSeq = 0
-	a.modelPrices = make(map[string]ModelPrice)
-	a.priceRevision = 0
-	a.priceSyncSettings = defaultPriceSyncSettings()
-	a.lastPriceSync = nil
 	a.dashboardPreferences = defaultDashboardPreferences()
 	a.apiKeyCiphertexts = make(map[string]string)
 	a.apiKeyLabels = make(map[string]string)
+	a.modelPriceOverrides = make(map[string]ModelPrice)
 	a.apiKeyCatalog = make(map[string]apiKeyCatalogEntry)
 	a.persistedAggregates = make(map[aggregateKey]struct{})
 	a.observedModelCounts = make(map[string]uint64)
@@ -1068,17 +1017,6 @@ func (a *storeActor) reload() error {
 		a.activeGeneration = findAPIKeyGeneration(generations, a.crypto)
 		a.since = time.Unix(0, decodeInt64(meta.Get(sinceKey))).UTC()
 		a.nextRequestSeq = decodeUint64(meta.Get(requestSequenceKey))
-		if raw := meta.Get(modelPricesKey); len(raw) > 0 {
-			var stored map[string]ModelPrice
-			if err := json.Unmarshal(raw, &stored); err != nil {
-				return fmt.Errorf("decode model prices: %w", err)
-			}
-			normalized, err := normalizeModelPrices(stored)
-			if err != nil {
-				return fmt.Errorf("validate model prices: %w", err)
-			}
-			a.modelPrices = normalized
-		}
 		if raw := meta.Get(dashboardPreferencesKey); len(raw) > 0 {
 			var stored DashboardPreferences
 			if err := json.Unmarshal(raw, &stored); err != nil {
@@ -1100,6 +1038,20 @@ func (a *storeActor) reload() error {
 			}
 			a.apiKeyLabels = cloneStringMap(labels)
 		}
+		if raw := meta.Get(modelPriceOverridesKey); len(raw) > 0 {
+			var stored map[string]ModelPrice
+			if err := json.Unmarshal(raw, &stored); err != nil {
+				return fmt.Errorf("decode model price overrides: %w", err)
+			}
+			normalized, err := normalizeModelPriceOverrides(stored)
+			if err != nil {
+				return fmt.Errorf("validate model price overrides: %w", err)
+			}
+			if normalized == nil {
+				normalized = make(map[string]ModelPrice)
+			}
+			a.modelPriceOverrides = normalized
+		}
 		catalog, err := loadAPIKeyCatalog(meta)
 		if err != nil {
 			// The catalog is derived state. Keep the primary aggregate/request data
@@ -1114,28 +1066,6 @@ func (a *storeActor) reload() error {
 			if entry.Ciphertext != "" {
 				a.apiKeyCiphertexts[ref] = entry.Ciphertext
 			}
-		}
-		a.priceRevision = decodeUint64(meta.Get(modelPriceRevisionKey))
-		if a.priceRevision == 0 && len(a.modelPrices) > 0 {
-			a.priceRevision = 1
-		}
-		if raw := meta.Get(modelPriceSettingsKey); len(raw) > 0 {
-			var stored PriceSyncSettings
-			if err := json.Unmarshal(raw, &stored); err != nil {
-				return fmt.Errorf("decode model price sync settings: %w", err)
-			}
-			normalized, err := normalizePriceSyncSettings(stored)
-			if err != nil {
-				return fmt.Errorf("validate model price sync settings: %w", err)
-			}
-			a.priceSyncSettings = normalized
-		}
-		if raw := meta.Get(modelPriceLastSyncKey); len(raw) > 0 {
-			var stored PriceSyncMetadata
-			if err := json.Unmarshal(raw, &stored); err != nil {
-				return fmt.Errorf("decode model price last sync: %w", err)
-			}
-			a.lastPriceSync = &stored
 		}
 		if raw := meta.Get(lastUsedKey); len(raw) > 0 {
 			a.lastUsed = time.Unix(0, decodeInt64(raw)).UTC()
@@ -1898,6 +1828,59 @@ func (a *storeActor) setAPIKeyLabel(ref, label string) error {
 	return nil
 }
 
+// setModelPriceOverride validates and persists one manual price. A nil or empty
+// price removes the override so the catalog rate applies again.
+func (a *storeActor) setModelPriceOverride(model string, price *ModelPrice) modelPriceResult {
+	key, err := normalizeOverrideModel(model)
+	if err != nil {
+		return modelPriceResult{err: withStatus(400, "%v", err)}
+	}
+	candidate := cloneModelPriceOverrides(a.modelPriceOverrides)
+	if candidate == nil {
+		candidate = make(map[string]ModelPrice)
+	}
+	if price == nil {
+		delete(candidate, key)
+	} else {
+		normalized, err := normalizeModelPrice(key, *price)
+		if err != nil {
+			return modelPriceResult{err: withStatus(400, "%v", err)}
+		}
+		if normalized.Empty() {
+			delete(candidate, key)
+		} else {
+			if len(candidate) >= maxModelPriceOverrides {
+				if _, replacing := candidate[key]; !replacing {
+					return modelPriceResult{err: withStatus(409, "model price override limit reached")}
+				}
+			}
+			candidate[key] = normalized
+		}
+	}
+	if err := a.saveModelPriceOverrides(candidate); err != nil {
+		return modelPriceResult{err: err}
+	}
+	a.modelPriceOverrides = candidate
+	return modelPriceResult{overrides: cloneModelPriceOverrides(candidate)}
+}
+
+func (a *storeActor) saveModelPriceOverrides(overrides map[string]ModelPrice) error {
+	return a.db.Update(func(tx *bolt.Tx) error {
+		meta := tx.Bucket(metaBucket)
+		if meta == nil {
+			return errors.New("metadata bucket is missing")
+		}
+		if len(overrides) == 0 {
+			return meta.Delete(modelPriceOverridesKey)
+		}
+		encoded, err := json.Marshal(overrides)
+		if err != nil {
+			return fmt.Errorf("encode model price overrides: %w", err)
+		}
+		return meta.Put(modelPriceOverridesKey, encoded)
+	})
+}
+
 func recoverInterruptedRestore(dataPath string) error {
 	rollbackPath := dataPath + ".rollback"
 	rollbackInfo, err := os.Stat(rollbackPath)
@@ -1981,33 +1964,6 @@ func validateRestoreDatabaseWithCrypto(path string, crypto cryptoContext) error 
 		}
 		if raw := meta.Get(requestSequenceKey); len(raw) != 0 && len(raw) != 8 {
 			return errors.New("invalid request sequence metadata")
-		}
-		if raw := meta.Get(modelPriceRevisionKey); len(raw) != 0 && len(raw) != 8 {
-			return errors.New("invalid model price revision metadata")
-		}
-		if raw := meta.Get(modelPricesKey); len(raw) > 0 {
-			var stored map[string]ModelPrice
-			if err := json.Unmarshal(raw, &stored); err != nil {
-				return fmt.Errorf("decode model prices: %w", err)
-			}
-			if _, err := normalizeModelPrices(stored); err != nil {
-				return fmt.Errorf("validate model prices: %w", err)
-			}
-		}
-		if raw := meta.Get(modelPriceSettingsKey); len(raw) > 0 {
-			var stored PriceSyncSettings
-			if err := json.Unmarshal(raw, &stored); err != nil {
-				return fmt.Errorf("decode model price sync settings: %w", err)
-			}
-			if _, err := normalizePriceSyncSettings(stored); err != nil {
-				return fmt.Errorf("validate model price sync settings: %w", err)
-			}
-		}
-		if raw := meta.Get(modelPriceLastSyncKey); len(raw) > 0 {
-			var stored PriceSyncMetadata
-			if err := json.Unmarshal(raw, &stored); err != nil {
-				return fmt.Errorf("decode model price last sync: %w", err)
-			}
 		}
 		if raw := meta.Get(dashboardPreferencesKey); len(raw) > 0 {
 			var stored DashboardPreferences
@@ -2203,7 +2159,6 @@ func (a *storeActor) restoreBackup(backup []byte) (*bolt.DB, error) {
 		return db, fmt.Errorf("reload restored database: %w", err)
 	}
 
-	a.costGeneration++
 	_ = os.Remove(rollbackPath)
 	return db, nil
 }
@@ -2220,17 +2175,16 @@ func migrateUsageSources(hours, requests *bolt.Bucket, version uint64) error {
 		Time     time.Time `json:"time"`
 		legacyDimensions
 		Counters
-		Result        string         `json:"result"`
-		LatencyNS     uint64         `json:"latency_ns"`
-		TTFTNS        uint64         `json:"ttft_ns"`
-		GenerationNS  uint64         `json:"generation_ns"`
-		TPS           float64        `json:"tps"`
-		CacheHit      bool           `json:"cache_hit"`
-		EstimatedCost *EstimatedCost `json:"estimated_cost,omitempty"`
+		Result       string  `json:"result"`
+		LatencyNS    uint64  `json:"latency_ns"`
+		TTFTNS       uint64  `json:"ttft_ns"`
+		GenerationNS uint64  `json:"generation_ns"`
+		TPS          float64 `json:"tps"`
+		CacheHit     bool    `json:"cache_hit"`
 	}
 
 	toCurrentRequest := func(request legacyRequestDetail) RequestDetail {
-		return RequestDetail{Sequence: request.Sequence, Time: request.Time, Dimensions: request.Dimensions, Counters: request.Counters, Result: request.Result, LatencyNS: request.LatencyNS, TTFTNS: request.TTFTNS, GenerationNS: request.GenerationNS, TPS: request.TPS, CacheHit: request.CacheHit, EstimatedCost: request.EstimatedCost}
+		return RequestDetail{Sequence: request.Sequence, Time: request.Time, Dimensions: request.Dimensions, Counters: request.Counters, Result: request.Result, LatencyNS: request.LatencyNS, TTFTNS: request.TTFTNS, GenerationNS: request.GenerationNS, TPS: request.TPS, CacheHit: request.CacheHit}
 	}
 
 	if version >= usageSourcesSchemaVersion {
@@ -2335,63 +2289,17 @@ func migrateUsageSources(hours, requests *bolt.Bucket, version uint64) error {
 }
 
 func migratePriceMetadata(meta *bolt.Bucket, version uint64) error {
-	prices := make(map[string]ModelPrice)
-	if raw := meta.Get(modelPricesKey); len(raw) > 0 {
-		var stored map[string]ModelPrice
-		if err := json.Unmarshal(raw, &stored); err != nil {
-			return fmt.Errorf("decode model prices: %w", err)
-		}
-		normalized, err := normalizeModelPrices(stored)
-		if err != nil {
-			return fmt.Errorf("validate model prices: %w", err)
-		}
-		prices = normalized
-	}
-	settings := defaultPriceSyncSettings()
-	if raw := meta.Get(modelPriceSettingsKey); len(raw) > 0 {
-		var stored PriceSyncSettings
-		if err := json.Unmarshal(raw, &stored); err != nil {
-			return fmt.Errorf("decode model price sync settings: %w", err)
-		}
-		normalized, err := normalizePriceSyncSettings(stored)
-		if err != nil {
-			return fmt.Errorf("validate model price sync settings: %w", err)
-		}
-		settings = normalized
-	}
-	if raw := meta.Get(modelPriceLastSyncKey); len(raw) > 0 {
-		var stored PriceSyncMetadata
-		if err := json.Unmarshal(raw, &stored); err != nil {
-			return fmt.Errorf("decode model price last sync: %w", err)
-		}
-	}
-	if version >= persistenceSchemaVersion {
-		return nil
-	}
-	encodedPrices, err := json.Marshal(prices)
-	if err != nil {
-		return fmt.Errorf("encode migrated model prices: %w", err)
-	}
-	encodedSettings, err := json.Marshal(settings)
-	if err != nil {
-		return fmt.Errorf("encode migrated model price sync settings: %w", err)
-	}
-	if len(prices) == 0 {
-		if err := meta.Delete(modelPricesKey); err != nil {
-			return err
-		}
-	} else if err := meta.Put(modelPricesKey, encodedPrices); err != nil {
-		return err
-	}
-	if err := meta.Put(modelPriceSettingsKey, encodedSettings); err != nil {
-		return err
-	}
-	revision := decodeUint64(meta.Get(modelPriceRevisionKey))
-	if revision == 0 && len(prices) > 0 {
-		revision = 1
-	}
-	if err := meta.Put(modelPriceRevisionKey, encodeUint64(revision)); err != nil {
-		return err
+	// Pricing was removed from the plugin. Drop every price-book key so an
+	// upgraded database carries no stale pricing state, while usage
+	// aggregates, request details, preferences, and API-key metadata stay intact.
+	for _, key := range [][]byte{
+		modelPricesKey,
+		modelPriceRevisionKey,
+		modelPriceSettingsKey,
+		modelPriceLastSyncKey,
+		[]byte("price_sync"),
+	} {
+		_ = meta.Delete(key)
 	}
 	return nil
 }
@@ -2666,7 +2574,6 @@ func (a *storeActor) reconfigure(config Config, crypto cryptoContext) error {
 	a.generations = generations
 	a.activeGeneration = generation
 	a.lastFlushErr = nil
-	a.costGeneration++
 	return nil
 }
 
@@ -2693,135 +2600,6 @@ func (a *storeActor) saveDashboardPreferences(preferences DashboardPreferences) 
 	}
 	a.dashboardPreferences = cloneDashboardPreferences(preferences)
 	return cloneDashboardPreferences(a.dashboardPreferences), nil
-}
-
-func (a *storeActor) priceBookResponse() ModelPricesResponse {
-	return ModelPricesResponse{
-		SchemaVersion: 2,
-		Revision:      a.priceRevision,
-		Prices:        cloneModelPrices(a.modelPrices),
-		SyncSettings:  clonePriceSyncSettings(a.priceSyncSettings),
-		LastSync:      clonePriceSyncMetadata(a.lastPriceSync),
-	}
-}
-
-func (a *storeActor) saveModelPrices(prices map[string]ModelPrice, settings *PriceSyncSettings) (ModelPricesResponse, error) {
-	next := make(map[string]ModelPrice, len(prices))
-	now := time.Now().UTC()
-	for model, price := range prices {
-		current, exists := a.modelPrices[model]
-		if exists && current.Source == priceSourceModelsDev && sameEditableModelPrice(current, price) {
-			next[model] = current
-			continue
-		}
-		price.Source = priceSourceManual
-		price.CatalogProvider = ""
-		price.CatalogModel = ""
-		price.UpdatedAt = now
-		next[model] = price
-	}
-	nextSettings := a.priceSyncSettings
-	if settings != nil {
-		nextSettings = clonePriceSyncSettings(*settings)
-	}
-	nextRevision := a.priceRevision + 1
-	if nextRevision == 0 {
-		nextRevision = 1
-	}
-	if err := a.persistPriceBook(next, nextSettings, a.lastPriceSync, nextRevision); err != nil {
-		return ModelPricesResponse{}, err
-	}
-	a.modelPrices = cloneModelPrices(next)
-	a.priceSyncSettings = clonePriceSyncSettings(nextSettings)
-	a.priceRevision = nextRevision
-	return a.priceBookResponse(), nil
-}
-
-func (a *storeActor) applyModelPriceSync(prices map[string]ModelPrice, settings PriceSyncSettings, metadata PriceSyncMetadata, expectedRevision uint64) (ModelPricesResponse, error) {
-	if a.priceRevision != expectedRevision {
-		return ModelPricesResponse{}, withStatus(409, "model prices changed while synchronization was running")
-	}
-	next := cloneModelPrices(a.modelPrices)
-	metadata.Created = 0
-	metadata.Updated = 0
-	metadata.SkippedManual = 0
-	for model, price := range prices {
-		current, exists := next[model]
-		if exists && current.Source != priceSourceModelsDev {
-			metadata.SkippedManual++
-			continue
-		}
-		if exists {
-			price.TimeZone = current.TimeZone
-			price.TimeTiers = cloneTimeTiers(current.TimeTiers)
-			metadata.Updated++
-		} else {
-			metadata.Created++
-		}
-		next[model] = price
-	}
-	metadata.Source = priceSourceModelsDev
-	metadata.CompletedAt = metadata.CompletedAt.UTC()
-	if metadata.CompletedAt.IsZero() {
-		metadata.CompletedAt = time.Now().UTC()
-	}
-	nextRevision := a.priceRevision + 1
-	if nextRevision == 0 {
-		nextRevision = 1
-	}
-	if err := a.persistPriceBook(next, settings, &metadata, nextRevision); err != nil {
-		return ModelPricesResponse{}, err
-	}
-	a.modelPrices = cloneModelPrices(next)
-	a.priceSyncSettings = clonePriceSyncSettings(settings)
-	a.lastPriceSync = clonePriceSyncMetadata(&metadata)
-	a.priceRevision = nextRevision
-	return a.priceBookResponse(), nil
-}
-
-func (a *storeActor) persistPriceBook(prices map[string]ModelPrice, settings PriceSyncSettings, lastSync *PriceSyncMetadata, revision uint64) error {
-	encodedPrices, err := json.Marshal(prices)
-	if err != nil {
-		return fmt.Errorf("encode model prices: %w", err)
-	}
-	encodedSettings, err := json.Marshal(settings)
-	if err != nil {
-		return fmt.Errorf("encode model price sync settings: %w", err)
-	}
-	var encodedLastSync []byte
-	if lastSync != nil {
-		encodedLastSync, err = json.Marshal(lastSync)
-		if err != nil {
-			return fmt.Errorf("encode model price last sync: %w", err)
-		}
-	}
-	if err := a.db.Update(func(tx *bolt.Tx) error {
-		meta := tx.Bucket(metaBucket)
-		if meta == nil {
-			return errors.New("metadata bucket is missing")
-		}
-		if len(prices) == 0 {
-			if err := meta.Delete(modelPricesKey); err != nil {
-				return err
-			}
-		} else if err := meta.Put(modelPricesKey, encodedPrices); err != nil {
-			return err
-		}
-		if err := meta.Put(modelPriceSettingsKey, encodedSettings); err != nil {
-			return err
-		}
-		if lastSync == nil {
-			if err := meta.Delete(modelPriceLastSyncKey); err != nil {
-				return err
-			}
-		} else if err := meta.Put(modelPriceLastSyncKey, encodedLastSync); err != nil {
-			return err
-		}
-		return meta.Put(modelPriceRevisionKey, encodeUint64(revision))
-	}); err != nil {
-		return fmt.Errorf("save model prices: %w", err)
-	}
-	return nil
 }
 
 func (a *storeActor) observedModels(now time.Time) ([]string, error) {
@@ -2916,6 +2694,8 @@ func (a *storeActor) reset() error {
 		if err := meta.Delete(observedModelsKey); err != nil {
 			return err
 		}
+		// Manual model prices are configuration, not usage data: they survive a
+		// statistics reset exactly like dashboard preferences.
 		return meta.Delete(lastUsedKey)
 	}); err != nil {
 		return fmt.Errorf("reset database: %w", err)
@@ -2946,7 +2726,6 @@ func (a *storeActor) reset() error {
 			return fmt.Errorf("reset API key generation: %w", err)
 		}
 	}
-	a.costGeneration++
 	return nil
 }
 
@@ -2967,14 +2746,12 @@ func (a *storeActor) queryRequests(queryRange usageRange, offset, limit int, mod
 		return RequestPage{}, withStatus(400, "result must be success or failed")
 	}
 
-	resolver := newModelPriceResolver(a.modelPrices, a.priceSyncSettings)
 	page := RequestPage{
-		GeneratedAt:       now.UTC(),
-		Range:             queryRange.Name,
-		PriceBookRevision: a.priceRevision,
-		Offset:            offset,
-		Limit:             limit,
-		Items:             make([]RequestDetail, 0, limit),
+		GeneratedAt: now.UTC(),
+		Range:       queryRange.Name,
+		Offset:      offset,
+		Limit:       limit,
+		Items:       make([]RequestDetail, 0, limit),
 	}
 	err := a.db.View(func(tx *bolt.Tx) error {
 		requests := tx.Bucket(requestsBucket)
@@ -2998,10 +2775,16 @@ func (a *storeActor) queryRequests(queryRange usageRange, offset, limit int, mod
 				return fmt.Errorf("decode request detail: %w", err)
 			}
 			item.Dimensions = sanitizeDimensionsSource(item.Dimensions)
+			// Expose the opaque fingerprint so the dashboard can label the row
+			// without revealing hashes, ciphertext, or the key itself.
+			if ref := apiKeyRef(item.APIKeyGeneration, item.APIKeyHash); ref != "" {
+				item.APIKeyRef = ref
+			}
 			// Stored records do not retain whether TotalTokens was explicit. Use
 			// the conservative unknown-provider path here; known protocol
 			// semantics still correct historical separate-reasoning records.
 			item.TPS = requestTPS(item, false)
+			item.EndToEndTPS = requestEndToEndTPS(item, false)
 			if model != "" && !modelFilterMatches(model, item.Model) {
 				continue
 			}
@@ -3015,8 +2798,6 @@ func (a *storeActor) queryRequests(queryRange usageRange, offset, limit int, mod
 			if page.Total <= offset || len(page.Items) >= limit {
 				continue
 			}
-			cost := estimateRequestCostWithResolver(item, resolver)
-			item.EstimatedCost = &cost
 			page.Items = append(page.Items, item)
 		}
 		return nil
@@ -3105,8 +2886,23 @@ func requiresExactStats(queryRange usageRange) bool {
 }
 
 func (a *storeActor) queryExactStats(queryRange usageRange, filter usageFilter, now time.Time) (StatsResponse, error) {
+	data, err := a.loadRequestAggregates(queryRange, now)
+	if err != nil {
+		return StatsResponse{}, err
+	}
+	return buildStatsForRangeWithFilter(data, a.since, a.lastUsed, usageRange{Name: queryRange.Name}, filter, now, a.apiKeyCiphertexts), nil
+}
+
+// loadRequestAggregates rebuilds minute-aligned counters from the persisted
+// request rows. It serves sub-hour dashboard windows (where the hourly
+// aggregate bucket is too coarse) and second-precision custom ranges.
+func (a *storeActor) loadRequestAggregates(queryRange usageRange, now time.Time) (map[aggregateKey]Counters, error) {
 	if err := queryRange.validate(); err != nil {
-		return StatsResponse{}, withStatus(400, "%v", err)
+		return nil, withStatus(400, "%v", err)
+	}
+	end := queryRange.End
+	if end.IsZero() {
+		end = now.UTC()
 	}
 	data := make(map[aggregateKey]Counters)
 	err := a.db.View(func(tx *bolt.Tx) error {
@@ -3120,10 +2916,10 @@ func (a *storeActor) queryExactStats(queryRange usageRange, filter usageFilter, 
 				continue
 			}
 			requestedAt := time.Unix(0, decodeInt64(key[:8])).UTC()
-			if !requestedAt.Before(queryRange.End) {
+			if !requestedAt.Before(end) {
 				continue
 			}
-			if requestedAt.Before(queryRange.Start) {
+			if !queryRange.Start.IsZero() && requestedAt.Before(queryRange.Start) {
 				break
 			}
 			var item RequestDetail
@@ -3149,9 +2945,9 @@ func (a *storeActor) queryExactStats(queryRange usageRange, filter usageFilter, 
 		return nil
 	})
 	if err != nil {
-		return StatsResponse{}, fmt.Errorf("query exact stats: %w", err)
+		return nil, fmt.Errorf("query exact stats: %w", err)
 	}
-	return buildStatsForRangeWithFilter(data, a.since, a.lastUsed, usageRange{Name: queryRange.Name}, filter, now, a.apiKeyCiphertexts), nil
+	return data, nil
 }
 
 func retentionCutoff(config Config, now time.Time) int64 {

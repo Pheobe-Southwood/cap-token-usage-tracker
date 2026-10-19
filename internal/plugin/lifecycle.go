@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+
+	"github.com/AITNR/cap-token-usage-tracker/internal/plugin/modelcatalog"
 )
 
 // version is set at build time with:
@@ -39,24 +41,24 @@ type registrationCapabilities struct {
 
 type pluginRuntime struct {
 	lifecycleMu       sync.Mutex
-	priceSyncMu       sync.Mutex
 	mu                sync.RWMutex
 	store             *Store
+	pricing           *pricingTable
 	config            Config
 	crypto            cryptoContext
 	apiKeyGeneration  uint64
 	apiKeyGenerations map[uint64]APIKeyCryptoGeneration
 	routes            registeredRoutes
-	modelsDevFetcher  *modelsDevFetcher
-	exchangeRates     *exchangeRateService
 	authResolver      *authIdentityResolver
-	priceSyncing      bool
-	fullModeMu        sync.Mutex
-	fullModeSessions  map[[32]byte]fullModeSession
-	fullModeUploads   map[string]fullModeUpload
+	sessionMu         sync.Mutex
+	sessions          map[[32]byte]time.Time
+	// ttftLinkage memoizes the sibling opencode-go plugin's published TTFT
+	// statistics so the models endpoint can link them in without re-parsing
+	// unchanged files.
+	ttftLinkage *ttftLinkageCache
 }
 
-var runtimeState = &pluginRuntime{}
+var runtimeState = &pluginRuntime{ttftLinkage: newTTFTLinkageCache()}
 
 func (r *pluginRuntime) register(raw []byte) (registration, error) {
 	request, config, err := decodeLifecycle(raw)
@@ -101,6 +103,11 @@ func (r *pluginRuntime) applyConfig(config Config) error {
 	if err != nil {
 		return err
 	}
+	if r.ttftLinkage == nil {
+		r.ttftLinkage = newTTFTLinkageCache()
+	} else {
+		r.ttftLinkage.reset()
+	}
 	r.mu.RLock()
 	current := r.store
 	currentConfig := r.config
@@ -115,8 +122,13 @@ func (r *pluginRuntime) applyConfig(config Config) error {
 		if err := current.ReconfigureWithCrypto(config, crypto); err != nil {
 			return err
 		}
+		pricing, err := newPricingTableFor(config, current)
+		if err != nil {
+			return err
+		}
 		generation, generations := current.APIKeyCryptoState()
 		r.config = config
+		r.pricing = pricing
 		r.crypto = crypto
 		r.apiKeyGeneration = generation
 		r.apiKeyGenerations = generations
@@ -127,23 +139,71 @@ func (r *pluginRuntime) applyConfig(config Config) error {
 	if err != nil {
 		return err
 	}
+	pricing, err := newPricingTableFor(config, next)
+	if err != nil {
+		_ = next.Close()
+		return err
+	}
 	r.mu.Lock()
 	old := r.store
 	r.store = next
+	r.pricing = pricing
 	r.config = config
 	r.crypto = crypto
 	r.apiKeyGeneration, r.apiKeyGenerations = next.APIKeyCryptoState()
 	r.mu.Unlock()
-	r.fullModeMu.Lock()
-	r.fullModeSessions = nil
-	r.fullModeUploads = nil
-	r.fullModeMu.Unlock()
+	r.sessionMu.Lock()
+	r.sessions = nil
+	r.sessionMu.Unlock()
 	if old != nil {
 		if err := old.Close(); err != nil {
 			return fmt.Errorf("close previous store: %w", err)
 		}
 	}
 	return nil
+}
+
+// newPricingTableFor builds the catalog service and loads the manual price
+// overrides for a store. A catalog that cannot even be parsed degrades to an
+// empty price table instead of failing registration.
+func newPricingTableFor(config Config, store *Store) (*pricingTable, error) {
+	catalog, err := modelcatalog.New(modelcatalog.Options{
+		CachePath:   modelCatalogCachePath(config.DataPath),
+		URL:         config.PricingCatalogURL,
+		AutoRefresh: config.PricingAutoRefresh,
+		StaleAfter:  config.PricingStaleAfter,
+	})
+	if err != nil {
+		catalog = nil
+	}
+	table := newPricingTable(catalog)
+	table.SetBuiltinTimePlans(config.PeakPricing)
+	if store == nil {
+		return table, nil
+	}
+	overrides, err := store.ModelPriceOverrides()
+	if err != nil {
+		return nil, err
+	}
+	table.SetOverrides(overrides)
+	return table, nil
+}
+
+// pricingTableRef returns the active price table without holding the runtime
+// lock while it is used.
+func (r *pluginRuntime) pricingTableRef() *pricingTable {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.pricing
+}
+
+// pricingStatus reports the catalog state for API responses.
+func (r *pluginRuntime) pricingStatus() pricingStatus {
+	table := r.pricingTableRef()
+	if table == nil {
+		return pricingStatus{Status: modelcatalog.Status{Status: modelcatalog.StatusMissing, Source: modelcatalog.SourceEmbedded}}
+	}
+	return pricingStatus{Status: table.Status(), Overrides: table.OverrideCount()}
 }
 
 func (r *pluginRuntime) handleUsage(raw []byte) (map[string]any, error) {
@@ -198,18 +258,17 @@ func (r *pluginRuntime) shutdown() error {
 	r.mu.Lock()
 	store := r.store
 	r.store = nil
+	r.pricing = nil
 	r.config = Config{}
 	r.crypto = cryptoContext{}
 	r.apiKeyGeneration = 0
 	r.apiKeyGenerations = nil
 	r.routes = registeredRoutes{}
-	r.exchangeRates = nil
 	r.authResolver = nil
 	r.mu.Unlock()
-	r.fullModeMu.Lock()
-	r.fullModeSessions = nil
-	r.fullModeUploads = nil
-	r.fullModeMu.Unlock()
+	r.sessionMu.Lock()
+	r.sessions = nil
+	r.sessionMu.Unlock()
 	if store == nil {
 		return nil
 	}
@@ -277,7 +336,9 @@ func pluginRegistration(schemaVersion uint32) registration {
 				{Name: "api_key_secret", Type: pluginapi.ConfigFieldTypeString, Description: "Secret for API-key encryption and keyed fingerprints. Defaults to 123456; set a custom value of at least 32 bytes for protection against database disclosure. Empty disables API-key tracking. Changing the value starts a new crypto generation while preserving historical records."},
 				{Name: "response_compression", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Compress eligible public dashboard HTML and JSON responses with gzip when supported by the client. Defaults to true."},
 				{Name: "response_compression_min_bytes", Type: pluginapi.ConfigFieldTypeInteger, Description: "Minimum eligible public response size in bytes before gzip compression. Defaults to 1024; range 0-16777216."},
-				{Name: "full_mode_session_ttl_minutes", Type: pluginapi.ConfigFieldTypeInteger, Description: "Full-mode session lifetime in minutes. Defaults to 15; range 1-1440. Tokens remain in page memory only and are not persisted."},
+				{Name: "session_ttl_minutes", Type: pluginapi.ConfigFieldTypeInteger, Description: "Lifetime of a dashboard access session in minutes. Defaults to 720; range 1-43200. Sessions are minted only through the management API, stored as SHA-256 digests in plugin memory, and never persisted."},
+				{Name: "ttft_supplement", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Link the sibling cap-opencode-go plugin's published hourly TTFT statistics into the models view. The host reports no TTFT for plugin executors, so without the link those models show no first-token latency. Defaults to true."},
+				{Name: "ttft_supplement_dir", Type: pluginapi.ConfigFieldTypeString, Description: "Directory holding the sibling plugin's shared.json and stats-*.json files. Defaults to the cap-opencode-go directory next to data_path. Only model aliases and per-hour TTFT counters are read; credentials are never decoded."},
 			},
 		},
 		Capabilities: registrationCapabilities{UsagePlugin: true, ManagementAPI: true},

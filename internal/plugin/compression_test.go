@@ -135,7 +135,7 @@ func TestHandleManagementCompressionScope(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	dashboard, err := runtime.handleManagement(dashboardRequest)
+	dashboard, err := authedCall(t, runtime, dashboardRequest)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -151,7 +151,7 @@ func TestHandleManagementCompressionScope(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	management, err := runtime.handleManagement(managementRequest)
+	management, err := authedCall(t, runtime, managementRequest)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -205,7 +205,6 @@ func TestPublicJSONRoutesCompress(t *testing.T) {
 		routes: registeredRoutes{
 			pluginID:          "test",
 			resourceStatsPath: "/v0/resource/plugins/test/stats",
-			resourceCostsPath: "/v0/resource/plugins/test/costs",
 		},
 	}
 	defer runtime.shutdown()
@@ -217,7 +216,7 @@ func TestPublicJSONRoutesCompress(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for _, path := range []string{runtime.routes.resourceStatsPath, runtime.routes.resourceCostsPath} {
+	for _, path := range []string{runtime.routes.resourceStatsPath} {
 		raw, err := json.Marshal(pluginapi.ManagementRequest{
 			Method:  http.MethodGet,
 			Path:    path,
@@ -227,7 +226,7 @@ func TestPublicJSONRoutesCompress(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		response, err := runtime.handleManagement(raw)
+		response, err := authedCall(t, runtime, raw)
 		if err != nil {
 			t.Fatal(err)
 		}

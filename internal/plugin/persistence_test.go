@@ -22,6 +22,7 @@ func testConfig(t *testing.T) Config {
 		RetentionDays:   30,
 		FlushInterval:   time.Hour,
 		FlushMaxRecords: 100,
+		PeakPricing:     true,
 	}
 }
 
@@ -476,7 +477,7 @@ func TestGroupsPageMergesFailedRecordsAcrossStatusCodes(t *testing.T) {
 	}
 }
 
-func TestSourceFilterAppliesToStatsRequestsAndCosts(t *testing.T) {
+func TestSourceFilterAppliesToStatsAndRequests(t *testing.T) {
 	config := testConfig(t)
 	config.SyncOnRecord = true
 	store, err := openStore(config)
@@ -502,10 +503,6 @@ func TestSourceFilterAppliesToStatsRequestsAndCosts(t *testing.T) {
 	page, err := store.queryRequestPageByFilter(queryRange, 0, 100, "", filter, "")
 	if err != nil || page.Total != 1 || len(page.Items) != 1 || page.Items[0].Source != "Codex-user@example.com" {
 		t.Fatalf("filtered request page = %+v, %v", page, err)
-	}
-	costs, err := store.queryCostsByFilter(queryRange, filter)
-	if err != nil || costs.Summary.Requests != 1 {
-		t.Fatalf("filtered costs = %+v, %v", costs, err)
 	}
 }
 
@@ -598,7 +595,7 @@ func TestDashboardPreferencesValidation(t *testing.T) {
 		func(value *DashboardPreferences) {
 			value.HiddenDimensionColumns = append([]string(nil), dimensionColumnKeys...)
 		},
-		func(value *DashboardPreferences) { value.TimeRangeMode = "yesterday" },
+		func(value *DashboardPreferences) { value.TimeRangeMode = "fortnight" },
 		func(value *DashboardPreferences) { value.TokenDisplayMode = "billion" },
 		func(value *DashboardPreferences) { value.TimeRangeStart = "2026-08-05" },
 		func(value *DashboardPreferences) {
@@ -650,63 +647,6 @@ func TestDashboardPreferencesAcceptRFC3339TimeRangesAndKeepLegacyDates(t *testin
 	} {
 		if _, err := normalizeDashboardPreferences(value); err == nil {
 			t.Fatalf("invalid timestamp preferences accepted: %+v", value)
-		}
-	}
-}
-
-func TestModelPricesPersistAcrossRestartAndStatsReset(t *testing.T) {
-	config := testConfig(t)
-	store, err := openStore(config)
-	if err != nil {
-		t.Fatal(err)
-	}
-	saved, err := store.SaveModelPrices(map[string]ModelPrice{
-		"gpt-test": {Input: 2.5, Output: 10},
-		"zero":     {},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(saved) != 2 || saved["gpt-test"].Output != 10 || saved["zero"].Source != priceSourceManual {
-		t.Fatalf("saved prices = %+v", saved)
-	}
-	if err := store.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	store, err = openStore(config)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer store.Close()
-	prices, err := store.QueryModelPrices()
-	if err != nil || len(prices) != 2 || prices["gpt-test"].Input != 2.5 || prices["zero"].Source != priceSourceManual {
-		t.Fatalf("prices after restart = %+v, %v", prices, err)
-	}
-	if err := store.Reset(); err != nil {
-		t.Fatal(err)
-	}
-	prices, err = store.QueryModelPrices()
-	if err != nil || len(prices) != 2 || prices["gpt-test"].Output != 10 || prices["zero"].Source != priceSourceManual {
-		t.Fatalf("stats reset removed model prices: %+v, %v", prices, err)
-	}
-}
-
-func TestModelPriceValidation(t *testing.T) {
-	config := testConfig(t)
-	store, err := openStore(config)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer store.Close()
-	for _, prices := range []map[string]ModelPrice{
-		{"": {Input: 1}},
-		{"bad": {Input: -1}},
-		{"bad": {Output: maxTokenPricePerM + 1}},
-		{"gpt": {Input: 1}, " gpt ": {Output: 2}},
-	} {
-		if _, err := store.SaveModelPrices(prices); err == nil || errorHTTPStatus(err) != 400 {
-			t.Fatalf("invalid prices accepted: %+v, %v", prices, err)
 		}
 	}
 }
@@ -1424,25 +1364,34 @@ func TestSchemaEightUsageSourcesMigrateAuthenticationIdentity(t *testing.T) {
 	}
 }
 
-func TestSchemaThreePricesMigrateAtomically(t *testing.T) {
+func TestLegacyPriceMetadataIsPrunedOnStartup(t *testing.T) {
 	config := testConfig(t)
 	db, err := bolt.Open(config.DataPath, 0o600, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	legacyPrices, _ := json.Marshal(map[string]any{
-		"paid": map[string]any{"input": 2.5, "output": 10.0},
-		"free": map[string]any{"input": 0.0, "output": 0.0},
-	})
+	priceSyncLegacyKey := []byte("price_sync")
 	if err := db.Update(func(tx *bolt.Tx) error {
 		meta, err := tx.CreateBucket(metaBucket)
 		if err != nil {
 			return err
 		}
-		if err := meta.Put(schemaKey, encodeUint64(3)); err != nil {
+		if err := meta.Put(schemaKey, encodeUint64(persistenceSchemaVersion)); err != nil {
 			return err
 		}
-		if err := meta.Put(modelPricesKey, legacyPrices); err != nil {
+		if err := meta.Put(modelPricesKey, []byte(`{"paid":{"input":2.5}}`)); err != nil {
+			return err
+		}
+		if err := meta.Put(priceSyncLegacyKey, []byte(`{}`)); err != nil {
+			return err
+		}
+		if err := meta.Put(modelPriceRevisionKey, encodeUint64(7)); err != nil {
+			return err
+		}
+		if err := meta.Put(modelPriceSettingsKey, []byte(`{}`)); err != nil {
+			return err
+		}
+		if err := meta.Put(modelPriceLastSyncKey, encodeUint64(1)); err != nil {
 			return err
 		}
 		if _, err := tx.CreateBucket(hoursBucket); err != nil {
@@ -1461,74 +1410,20 @@ func TestSchemaThreePricesMigrateAtomically(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	book, err := store.QueryPriceBook()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if book.Revision != 1 || book.Prices["paid"].Source != priceSourceManual || book.Prices["free"].Source != priceSourceManual {
-		t.Fatalf("migrated price book = %+v", book)
-	}
-	if len(book.SyncSettings.ProviderPriority) == 0 {
-		t.Fatalf("migrated sync settings = %+v", book.SyncSettings)
-	}
-	if err := store.Reset(); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.Close(); err != nil {
-		t.Fatal(err)
-	}
-	store, err = openStore(config)
-	if err != nil {
-		t.Fatal(err)
-	}
 	defer store.Close()
-	book, err = store.QueryPriceBook()
-	if err != nil || len(book.Prices) != 2 || book.Prices["free"].Source != priceSourceManual {
-		t.Fatalf("migrated prices after reset/restart = %+v, %v", book, err)
-	}
-}
 
-func TestFailedSchemaThreePriceMigrationKeepsSchema(t *testing.T) {
-	config := testConfig(t)
-	db, err := bolt.Open(config.DataPath, 0o600, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := db.Update(func(tx *bolt.Tx) error {
-		meta, err := tx.CreateBucket(metaBucket)
-		if err != nil {
-			return err
-		}
-		if err := meta.Put(schemaKey, encodeUint64(3)); err != nil {
-			return err
-		}
-		if err := meta.Put(modelPricesKey, []byte(`{"bad":{"input":-1}}`)); err != nil {
-			return err
-		}
-		if _, err := tx.CreateBucket(hoursBucket); err != nil {
-			return err
-		}
-		_, err = tx.CreateBucket(requestsBucket)
-		return err
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if err := db.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if store, err := openStore(config); err == nil {
-		_ = store.Close()
-		t.Fatal("invalid schema-three prices migrated successfully")
-	}
-	db, err = bolt.Open(config.DataPath, 0o600, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-	if err := db.View(func(tx *bolt.Tx) error {
-		version := decodeUint64(tx.Bucket(metaBucket).Get(schemaKey))
-		if version != 3 {
-			return fmt.Errorf("schema version changed to %d after failed migration", version)
+	if err := store.db.View(func(tx *bolt.Tx) error {
+		meta := tx.Bucket(metaBucket)
+		for _, key := range [][]byte{
+			modelPricesKey,
+			priceSyncLegacyKey,
+			modelPriceRevisionKey,
+			modelPriceSettingsKey,
+			modelPriceLastSyncKey,
+		} {
+			if meta.Get(key) != nil {
+				return fmt.Errorf("%s key was not pruned", key)
+			}
 		}
 		return nil
 	}); err != nil {

@@ -12,29 +12,30 @@ const (
 )
 
 // RequestDetail contains metadata and usage counters for one model request.
-// Prompt and response content are intentionally never persisted.
+// Prompt and response content are intentionally never persisted. TPS is the
+// generation throughput (output tokens over latency minus TTFT); EndToEndTPS is
+// the end-to-end throughput over the whole request latency.
 type RequestDetail struct {
 	Sequence uint64    `json:"sequence"`
 	Time     time.Time `json:"time"`
 	Dimensions
 	Counters
-	Result        string         `json:"result"`
-	LatencyNS     uint64         `json:"latency_ns"`
-	TTFTNS        uint64         `json:"ttft_ns"`
-	GenerationNS  uint64         `json:"generation_ns"`
-	TPS           float64        `json:"tps"`
-	CacheHit      bool           `json:"cache_hit"`
-	EstimatedCost *EstimatedCost `json:"estimated_cost,omitempty"`
+	Result       string  `json:"result"`
+	LatencyNS    uint64  `json:"latency_ns"`
+	TTFTNS       uint64  `json:"ttft_ns"`
+	GenerationNS uint64  `json:"generation_ns"`
+	TPS          float64 `json:"tps"`
+	EndToEndTPS  float64 `json:"end_to_end_tps,omitempty"`
+	CacheHit     bool    `json:"cache_hit"`
 }
 
 type RequestPage struct {
-	GeneratedAt       time.Time       `json:"generated_at"`
-	Range             string          `json:"range"`
-	PriceBookRevision uint64          `json:"price_book_revision"`
-	Total             int             `json:"total"`
-	Offset            int             `json:"offset"`
-	Limit             int             `json:"limit"`
-	Items             []RequestDetail `json:"items"`
+	GeneratedAt time.Time       `json:"generated_at"`
+	Range       string          `json:"range"`
+	Total       int             `json:"total"`
+	Offset      int             `json:"offset"`
+	Limit       int             `json:"limit"`
+	Items       []RequestDetail `json:"items"`
 }
 
 func (p *RequestPage) Redact() {
@@ -123,6 +124,17 @@ func requestTPS(item RequestDetail, explicitTotal bool) float64 {
 	}
 	outputTokens := effectiveOutputTokensForTPS(item.Dimensions, item.Counters, explicitTotal)
 	return float64(outputTokens) / (float64(item.GenerationNS) / float64(time.Second))
+}
+
+// requestEndToEndTPS measures throughput across the entire request, including
+// the first-token wait. It is derived at read time and never persisted, so old
+// rows expose it without a migration.
+func requestEndToEndTPS(item RequestDetail, explicitTotal bool) float64 {
+	if item.LatencyNS == 0 {
+		return 0
+	}
+	outputTokens := effectiveOutputTokensForTPS(item.Dimensions, item.Counters, explicitTotal)
+	return float64(outputTokens) / (float64(item.LatencyNS) / float64(time.Second))
 }
 
 func requestDetailForUsage(usage normalizedUsage, sequence uint64) RequestDetail {

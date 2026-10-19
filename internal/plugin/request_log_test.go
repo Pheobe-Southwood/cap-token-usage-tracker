@@ -30,6 +30,36 @@ func TestRequestDetailForUsageSeparateReasoningTPS(t *testing.T) {
 	}
 }
 
+func TestRequestEndToEndTPSUsesWholeLatency(t *testing.T) {
+	usage := normalizedUsage{
+		Dimensions:  Dimensions{Provider: "cap-opencode-go", Model: "Beam"},
+		RequestedAt: time.Date(2026, 10, 17, 12, 0, 0, 0, time.UTC),
+		LatencyNS:   uint64(8 * time.Second),
+		TTFTNS:      uint64(time.Second),
+		Counters:    Counters{Requests: 1, InputTokens: 100, OutputTokens: 200, TotalTokens: 300},
+	}
+	item := requestDetailForUsage(usage, 1)
+	item.EndToEndTPS = requestEndToEndTPS(item, false)
+	// End to end throughput divides the output by the whole request latency,
+	// while generation TPS keeps excluding the first-token wait.
+	if math.Abs(item.EndToEndTPS-25) > 1e-9 {
+		t.Fatalf("end-to-end TPS = %v, want 25", item.EndToEndTPS)
+	}
+	if item.TPS <= item.EndToEndTPS {
+		t.Fatalf("generation TPS %v must exceed end-to-end TPS %v", item.TPS, item.EndToEndTPS)
+	}
+	// A failed request without latency must not divide by zero.
+	failed := requestDetailForUsage(normalizedUsage{
+		Dimensions:  Dimensions{Provider: "cap-opencode-go", Model: "Beam"},
+		RequestedAt: time.Date(2026, 10, 17, 12, 0, 0, 0, time.UTC),
+		Counters:    Counters{Requests: 1, TotalTokens: 10},
+	}, 1)
+	failed.EndToEndTPS = requestEndToEndTPS(failed, false)
+	if failed.EndToEndTPS != 0 || failed.TPS != 0 {
+		t.Fatalf("zero-latency request reported TPS: %+v", failed)
+	}
+}
+
 func TestEffectiveOutputTokensForTPS(t *testing.T) {
 	tests := []struct {
 		name          string

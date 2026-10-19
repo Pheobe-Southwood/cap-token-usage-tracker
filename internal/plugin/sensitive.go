@@ -206,27 +206,11 @@ func parseAPIKeyRef(ref string) (uint64, string, bool) {
 	return generation, hash, true
 }
 
-func (r *pluginRuntime) sensitiveJSONResponse(status int, value Sensitive, fullMode bool, crypto cryptoContext, generations map[uint64]APIKeyCryptoGeneration) pluginapi.ManagementResponse {
-	if fullMode {
-		value.Reveal(func(ciphertext, fingerprint string, generation uint64) (string, string) {
-			metadata, ok := generations[generation]
-			if !ok || metadata.IdentityMissing || metadata.KeyID == "" {
-				return "", apiKeyStatusIdentityMissing
-			}
-			if !crypto.enabled || metadata.KeyID != crypto.keyID || metadata.HashVersion != apiKeyHashVersion {
-				return "", apiKeyStatusGenerationUnavailable
-			}
-			if ciphertext == "" {
-				return "", apiKeyStatusCiphertextMissing
-			}
-			plaintext, err := decryptAPIKeyForGeneration(crypto, ciphertext, fingerprint, generation)
-			if err != nil || plaintext == "" {
-				return "", apiKeyStatusCiphertextInvalid
-			}
-			return plaintext, apiKeyStatusAvailable
-		})
-	} else {
-		value.Redact()
-	}
+// sensitiveJSONResponse always redacts key material. The plugin has no route
+// that returns an API-key plaintext: fingerprints and display labels are the
+// only key-derived data that reaches a browser, and decryption exists solely so
+// operators can inspect a database backup offline with their own secret.
+func (r *pluginRuntime) sensitiveJSONResponse(status int, value Sensitive) pluginapi.ManagementResponse {
+	value.Redact()
 	return jsonResponse(status, value)
 }
